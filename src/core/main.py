@@ -2153,7 +2153,8 @@ class LiquidSpikingTrainer:
         # Handle remaining accumulated gradients
         if accumulated_loss > 0:
             if self.config.gradient_clip > 0:
-                if self.scaler:
+                # Only unscale if using mixed precision
+                if self.config.mixed_precision and self.scaler:
                     self.scaler.unscale_(self.optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), 
@@ -2161,7 +2162,8 @@ class LiquidSpikingTrainer:
                 )
                 gradient_norm_sum += grad_norm.item()
             
-            if self.scaler:
+            # Only use scaler.step() if using mixed precision
+            if self.config.mixed_precision and self.scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -2193,7 +2195,8 @@ class LiquidSpikingTrainer:
         # Handle remaining accumulated gradients
         if accumulated_loss > 0:
             if self.config.gradient_clip > 0:
-                if self.scaler:
+                # Only unscale if using mixed precision
+                if self.config.mixed_precision and self.scaler:
                     self.scaler.unscale_(self.optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), 
@@ -2201,7 +2204,8 @@ class LiquidSpikingTrainer:
                 )
                 gradient_norm_sum += grad_norm.item()
             
-            if self.scaler:
+            # Only use scaler.step() if using mixed precision
+            if self.config.mixed_precision and self.scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
