@@ -2152,25 +2152,30 @@ class LiquidSpikingTrainer:
         
         # Handle remaining accumulated gradients
         if accumulated_loss > 0:
-            if self.config.gradient_clip > 0:
-                # Only unscale if using mixed precision
+            # Check if we have any gradients to work with
+            has_gradients = any(p.grad is not None for p in self.model.parameters())
+            
+            if has_gradients:
+                if self.config.gradient_clip > 0:
+                    # Only unscale if using mixed precision
+                    if self.config.mixed_precision and self.scaler:
+                        self.scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), 
+                        self.config.gradient_clip
+                    )
+                    gradient_norm_sum += grad_norm.item()
+                
+                # Only use scaler.step() if using mixed precision
                 if self.config.mixed_precision and self.scaler:
-                    self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    self.config.gradient_clip
-                )
-                gradient_norm_sum += grad_norm.item()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad()
+                self._update_ema()
             
-            # Only use scaler.step() if using mixed precision
-            if self.config.mixed_precision and self.scaler:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-            
-            self.optimizer.zero_grad()
-            self._update_ema()
             total_loss += accumulated_loss
             num_batches += 1
             
@@ -2191,30 +2196,6 @@ class LiquidSpikingTrainer:
                     'grad_norm': f'{avg_grad_norm:.3f}',
                     'gpus': len(self.gpu_ids) if self.gpu_ids else 0
                 })
-        
-        # Handle remaining accumulated gradients
-        if accumulated_loss > 0:
-            if self.config.gradient_clip > 0:
-                # Only unscale if using mixed precision
-                if self.config.mixed_precision and self.scaler:
-                    self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    self.config.gradient_clip
-                )
-                gradient_norm_sum += grad_norm.item()
-            
-            # Only use scaler.step() if using mixed precision
-            if self.config.mixed_precision and self.scaler:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-            
-            self.optimizer.zero_grad()
-            self._update_ema()
-            total_loss += accumulated_loss
-            num_batches += 1
         
         avg_loss = total_loss / max(num_batches, 1)
         avg_grad_norm = gradient_norm_sum / max(num_batches, 1)
