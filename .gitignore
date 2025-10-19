@@ -1,0 +1,159 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+
+# Virtual Environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+nn/
+pyvenv.cfg
+
+# PyTorch Models
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+models/*.pt
+models/*.pth
+!models/.gitkeep
+
+# Datasets and Cache
+data/*/
+!data/.gitkeep
+cache/
+*.cache
+programming_dataset_cache/
+test_cache/
+*.h5
+*.hdf5
+
+# Outputs
+outputs/
+*.txt
+!requirements.txt
+!LICENSE
+!README.md
+!MANIFEST.in
+logs/
+nn/
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Testing
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+*.py,cover
+.hypothesis/
+
+# Profiling
+*.prof
+*.lprof
+
+# Environments
+.env
+.venv
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+
+# Temporary files
+*.swp
+*.swo
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Large files and experiments
+experiments/*/
+!experiments/.gitkeep
+*.npy
+*.npz
+
+# Compiled translations
+*.mo
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Configuration files with secrets (keep templates)
+*_secret.json
+*_private.json
+config_local.json

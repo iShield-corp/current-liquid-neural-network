@@ -1,0 +1,43 @@
+include README.md
+include LICENSE
+include requirements.txt
+include pyproject.toml
+include setup.py
+
+# Include all Python files
+recursive-include src *.py
+recursive-include scripts *.py
+recursive-include tests *.py
+
+# Include documentation
+recursive-include docs *.md *.rst *.txt
+
+# Include configuration files
+include *.yaml *.yml *.json *.toml *.cfg *.ini
+
+# Exclude cache and build files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.pyd
+global-exclude __pycache__
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.egg-info
+
+# Exclude virtual environments
+prune nn/
+prune venv/
+prune env/
+prune .venv/
+
+# Exclude IDE files
+global-exclude .vscode
+global-exclude .idea
+global-exclude *.swp
+global-exclude *.swo
+
+# Exclude git files
+global-exclude .git*
+
+# Include specific model files if needed
+# recursive-include models *.pth *.pt *.onnx
