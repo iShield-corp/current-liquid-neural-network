@@ -553,6 +553,27 @@ class ModelConfig:
     stdp_layers_to_enhance: Optional[List[str]] = None  # None = all
     compute_importance_interval: int = 1  # How often to compute Fisher information (epochs)
     
+    # === Mamba Integration Configuration (NEW) ===
+    use_mamba: bool = False  # Enable Mamba blocks
+    integration_mode: str = 'bidirectional'  # 'sequential', 'parallel', 'bidirectional'
+    
+    # Mamba-specific parameters
+    mamba_d_state: int = 16  # State space dimension
+    mamba_d_conv: int = 4    # Convolution kernel size
+    mamba_expand: int = 2    # Expansion factor
+    
+    # Communication parameters
+    spike_to_mamba_method: str = 'temporal'  # 'rate', 'temporal', 'potential'
+    spike_temporal_tau: float = 20.0  # Time constant for temporal coding
+    
+    # Gating parameters (for parallel mode)
+    use_adaptive_gating: bool = True
+    num_gate_heads: int = 4
+    
+    # Cross-attention parameters (for bidirectional mode)
+    use_cross_attention: bool = False  # Only for bidirectional
+    cross_attn_heads: int = 8
+    
     def __post_init__(self):
         """Set default values for optional parameters."""
         if self.embedding_dim is None:
@@ -616,6 +637,22 @@ class ModelConfig:
             print("📌 Auto-enabling homeostatic STDP for continual learning")
             self.use_stdp = True
             self.stdp_type = 'homeostatic'
+        
+        # Validate Mamba settings
+        if self.use_mamba:
+            valid_modes = ['sequential', 'parallel', 'bidirectional']
+            if self.integration_mode not in valid_modes:
+                raise ValueError(
+                    f"Invalid integration_mode: {self.integration_mode}. "
+                    f"Must be one of {valid_modes}"
+                )
+            
+            if self.integration_mode == 'bidirectional':
+                self.use_cross_attention = True
+            
+            print(f"🔄 Mamba integration enabled: mode={self.integration_mode}")
+            print(f"   d_state={self.mamba_d_state}, "
+                  f"d_conv={self.mamba_d_conv}, expand={self.mamba_expand}")
     
     def to_dict(self):
         return {
@@ -675,7 +712,19 @@ class ModelConfig:
             'replay_buffer_size': self.replay_buffer_size,
             'replay_sampling_strategy': self.replay_sampling_strategy,
             'stdp_layers_to_enhance': self.stdp_layers_to_enhance,
-            'compute_importance_interval': self.compute_importance_interval
+            'compute_importance_interval': self.compute_importance_interval,
+            # Mamba parameters
+            'use_mamba': self.use_mamba,
+            'integration_mode': self.integration_mode,
+            'mamba_d_state': self.mamba_d_state,
+            'mamba_d_conv': self.mamba_d_conv,
+            'mamba_expand': self.mamba_expand,
+            'spike_to_mamba_method': self.spike_to_mamba_method,
+            'spike_temporal_tau': self.spike_temporal_tau,
+            'use_adaptive_gating': self.use_adaptive_gating,
+            'num_gate_heads': self.num_gate_heads,
+            'use_cross_attention': self.use_cross_attention,
+            'cross_attn_heads': self.cross_attn_heads
         }
     
     @classmethod
