@@ -473,6 +473,34 @@ class LiquidSpikingCLI:
                              help='Replay sampling strategy (default: balanced)')
         cl_group.add_argument('--compute-importance-interval', type=int, default=100,
                              help='Compute parameter importance every N batches (default: 100)')
+        
+        # Mamba Integration parameters (NEW)
+        mamba_group = train_parser.add_argument_group('Mamba Integration', 
+                                                      'Mamba SSM for long-range dependencies')
+        mamba_group.add_argument('--use-mamba', action='store_true',
+                                help='Enable Mamba SSM integration')
+        mamba_group.add_argument('--integration-mode', type=str, default='bidirectional',
+                                choices=['sequential', 'parallel', 'bidirectional'],
+                                help='Integration mode: sequential (simple), parallel (dual paths), bidirectional (full cross-attention) (default: bidirectional)')
+        mamba_group.add_argument('--mamba-d-state', type=int, default=16,
+                                help='Mamba state dimension (default: 16)')
+        mamba_group.add_argument('--mamba-d-conv', type=int, default=4,
+                                help='Mamba convolution kernel size (default: 4)')
+        mamba_group.add_argument('--mamba-expand', type=int, default=2,
+                                help='Mamba expansion factor (default: 2)')
+        mamba_group.add_argument('--spike-to-mamba-method', type=str, default='temporal',
+                                choices=['rate', 'temporal', 'potential'],
+                                help='Spike-to-Mamba conversion method (default: temporal)')
+        mamba_group.add_argument('--spike-temporal-tau', type=float, default=20.0,
+                                help='Time constant for temporal spike coding (default: 20.0)')
+        mamba_group.add_argument('--use-adaptive-gating', action='store_true',
+                                help='Use adaptive gating between Liquid and Mamba')
+        mamba_group.add_argument('--num-gate-heads', type=int, default=4,
+                                help='Number of gating heads (default: 4)')
+        mamba_group.add_argument('--use-cross-attention', action='store_true',
+                                help='Use cross-attention between Liquid and Mamba')
+        mamba_group.add_argument('--cross-attn-heads', type=int, default=8,
+                                help='Number of cross-attention heads (default: 8)')
     
     def _add_inference_parser(self, subparsers):
         """Add inference subcommand parser."""
@@ -1587,6 +1615,18 @@ class LiquidSpikingCLI:
             'replay_buffer_size': 'replay_buffer_size',
             'replay_strategy': 'replay_sampling_strategy',
             'compute_importance_interval': 'compute_importance_interval',
+            # Mamba integration parameters (NEW)
+            'use_mamba': 'use_mamba',
+            'integration_mode': 'integration_mode',
+            'mamba_d_state': 'mamba_d_state',
+            'mamba_d_conv': 'mamba_d_conv',
+            'mamba_expand': 'mamba_expand',
+            'spike_to_mamba_method': 'spike_to_mamba_method',
+            'spike_temporal_tau': 'spike_temporal_tau',
+            'use_adaptive_gating': 'use_adaptive_gating',
+            'num_gate_heads': 'num_gate_heads',
+            'use_cross_attention': 'use_cross_attention',
+            'cross_attn_heads': 'cross_attn_heads',
         }
         
         for arg_name, config_attr in override_mapping.items():
