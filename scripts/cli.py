@@ -915,8 +915,7 @@ class LiquidSpikingCLI:
                 if val_loader is not None:
                     with Status("[yellow]Running validation...", spinner="dots"):
                         with suppress_logging():
-                            is_best = trainer.validate(val_loader)
-                            val_loss = trainer.val_losses[-1]
+                            val_loss, val_accuracy, is_best = trainer.validate(val_loader)
                             
                             if is_best:
                                 best_path = output_dir / f"{args.task}_best_model.pt"
