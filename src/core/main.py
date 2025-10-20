@@ -2199,50 +2199,9 @@ class LiquidSpikingTrainer:
                     'gpus': len(self.gpu_ids) if self.gpu_ids else 0
                 })
         
-        # Handle remaining accumulated gradients
-        if accumulated_loss > 0:
-            if self.config.gradient_clip > 0:
-                # Only unscale if using mixed precision
-                if self.config.mixed_precision and self.scaler:
-                    self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    self.config.gradient_clip
-                )
-                gradient_norm_sum += grad_norm.item()
-            
-            # Only use scaler.step() if using mixed precision
-            if self.config.mixed_precision and self.scaler:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-            
-            self.optimizer.zero_grad()
-            self._update_ema()
-            total_loss += accumulated_loss
-            num_batches += 1
-            
-            # Memory cleanup to prevent leaks
-            if batch_idx % memory_cleanup_interval == 0 and batch_idx > 0:
-                # Explicit cleanup of intermediate tensors
-                del data, targets, outputs, loss
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    
-            # Update progress bar with detailed metrics (only on main process)
-            if show_progress and hasattr(progress_bar, 'set_postfix') and num_batches > 0:
-                current_lr = self.optimizer.param_groups[0]['lr']
-                avg_grad_norm = gradient_norm_sum / num_batches if num_batches > 0 else 0
-                progress_bar.set_postfix({
-                    'loss': f'{total_loss/num_batches:.4f}',
-                    'lr': f'{current_lr:.2e}',
-                    'grad_norm': f'{avg_grad_norm:.3f}',
-                    'gpus': len(self.gpu_ids) if self.gpu_ids else 0
-                })
-        
-        # Handle remaining accumulated gradients
-        if accumulated_loss > 0:
+        # Handle remaining accumulated gradients after loop completes
+        # Only process if we actually accumulated gradients (check if backward was called)
+        if accumulated_loss > 0 and (batch_idx + 1) % self.accumulation_steps != 0:
             if self.config.gradient_clip > 0:
                 # Only unscale if using mixed precision
                 if self.config.mixed_precision and self.scaler:
