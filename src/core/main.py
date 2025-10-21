@@ -2200,19 +2200,24 @@ class LiquidSpikingTrainer:
                 })
         
         # Handle remaining accumulated gradients after loop completes
-        # Only process if we actually accumulated gradients (check if backward was called)
-        if accumulated_loss > 0 and (batch_idx + 1) % self.accumulation_steps != 0:
+        # ONLY step if we have unprocessed gradients from incomplete accumulation
+        remaining_batches = (batch_idx + 1) % self.accumulation_steps
+        if accumulated_loss > 0 and remaining_batches != 0:
+            # We have gradients that were accumulated but not yet stepped
+            # The backward() was already called in the loop via scaler
+            
             if self.config.gradient_clip > 0:
-                # Only unscale if using mixed precision
+                # Unscale before clipping (only for mixed precision)
                 if self.config.mixed_precision and self.scaler:
                     self.scaler.unscale_(self.optimizer)
+                
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), 
                     self.config.gradient_clip
                 )
                 gradient_norm_sum += grad_norm.item()
             
-            # Only use scaler.step() if using mixed precision
+            # Step optimizer
             if self.config.mixed_precision and self.scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()

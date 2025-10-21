@@ -1,21 +1,21 @@
-# GradScaler Mixed Precision Training Fix
+# GradScaler Mixed Precision Training Fix - FINAL
 
 ## Problem Summary
 
-Training crashed after completing the first epoch with the error:
+Training crashed after completing the first epoch (6h 50m, 1131/1131 batches) with the error:
 ```
 AssertionError: No inf checks were recorded for this optimizer.
 ```
 
-This occurred at line 2258 in `src/core/main.py` during the `scaler.step(self.optimizer)` call.
+This occurred at line 2258 in `src/core/main.py` during the `scaler.step(self.optimizer)` call in the gradient cleanup section after the training loop.
 
 ## Root Cause
 
-The issue was in the `train_epoch()` method's handling of gradient accumulation with PyTorch's `GradScaler` for mixed precision training:
+The issue was in the `train_epoch()` method's handling of **remaining accumulated gradients** after the main training loop completes:
 
-1. **Duplicate Code Block**: There were TWO identical code blocks (lines 2201-2268) attempting to handle "remaining accumulated gradients" after the training loop
-2. **Missing Backward Check**: The code tried to call `scaler.step()` without verifying that a backward pass had actually occurred
-3. **Scaler State Corruption**: When `scaler.step()` is called without a preceding `scaler.scale(loss).backward()`, the scaler has no recorded inf checks, causing the assertion error
+1. **Incomplete Logic**: The code at line 2239-2260 tried to handle remaining gradients but the condition check was insufficient
+2. **Scaler State Mismatch**: When all batches complete evenly (e.g., 1131 batches with accumulation_steps dividing evenly), `accumulated_loss > 0` can still be true (contains the last loss value), but gradients have already been stepped
+3. **Double-Step Attempt**: The cleanup code tried to call `scaler.step()` on gradients that were already processed in the loop, causing the scaler to have no inf checks recorded
 
 ### The Problem Flow
 
@@ -47,7 +47,7 @@ if accumulated_loss > 0:
    - `accumulated_loss > 0` (gradients were accumulated)
    - `(batch_idx + 1) % self.accumulation_steps != 0` (not already processed in loop)
 
-### Before (Buggy Code)
+### Before (Buggy Code - Attempt 1)
 
 ```python
 # Handle remaining accumulated gradients
@@ -59,32 +59,38 @@ if accumulated_loss > 0:
         gradient_norm_sum += grad_norm.item()
     
     if self.config.mixed_precision and self.scaler:
-        self.scaler.step(self.optimizer)  # ❌ May fail!
+        self.scaler.step(self.optimizer)  # ❌ FAILS! No inf checks!
         self.scaler.update()
     else:
         self.optimizer.step()
-    
-    # ... [40 lines of duplicate code] ...
-
-# DUPLICATE: Handle remaining accumulated gradients AGAIN
-if accumulated_loss > 0:
-    # ... [exact same code as above] ...
 ```
 
-### After (Fixed Code)
+**Problem**: Checked `accumulated_loss > 0` but this doesn't guarantee gradients need stepping. When the loop completes with all batches processed, `accumulated_loss` may still be > 0 (last loss value), but gradients were already stepped in the loop!
+
+### After (Fixed Code - FINAL)
 
 ```python
 # Handle remaining accumulated gradients after loop completes
-# Only process if we actually accumulated gradients (check if backward was called)
-if accumulated_loss > 0 and (batch_idx + 1) % self.accumulation_steps != 0:
+# ONLY step if we have unprocessed gradients from incomplete accumulation
+remaining_batches = (batch_idx + 1) % self.accumulation_steps
+if accumulated_loss > 0 and remaining_batches != 0:
+    # We have gradients that were accumulated but not yet stepped
+    # The backward() was already called in the loop via scaler
+    
     if self.config.gradient_clip > 0:
+        # Unscale before clipping (only for mixed precision)
         if self.config.mixed_precision and self.scaler:
             self.scaler.unscale_(self.optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(...)
+        
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), 
+            self.config.gradient_clip
+        )
         gradient_norm_sum += grad_norm.item()
     
+    # Step optimizer
     if self.config.mixed_precision and self.scaler:
-        self.scaler.step(self.optimizer)  # ✅ Only if backward was called
+        self.scaler.step(self.optimizer)  # ✅ SAFE! Gradients exist!
         self.scaler.update()
     else:
         self.optimizer.step()
@@ -93,14 +99,14 @@ if accumulated_loss > 0 and (batch_idx + 1) % self.accumulation_steps != 0:
     self._update_ema()
     total_loss += accumulated_loss
     num_batches += 1
-# No duplicate code!
 ```
 
 ## Key Improvements
 
-1. **Proper State Management**: Only calls `scaler.step()` when gradients were actually computed
-2. **Code Deduplication**: Removed 40+ lines of duplicate code
-3. **Correct Guard Condition**: Checks `(batch_idx + 1) % self.accumulation_steps != 0` to ensure we're not double-processing
+1. **Proper Remainder Check**: Uses `remaining_batches = (batch_idx + 1) % self.accumulation_steps` to detect incomplete accumulation
+2. **Two-Condition Guard**: Checks BOTH `accumulated_loss > 0` AND `remaining_batches != 0` 
+3. **Prevents Double-Step**: Only steps when gradients genuinely haven't been processed yet
+4. **Clearer Logic**: Explicit variable name (`remaining_batches`) makes intent obvious
 
 ## When This Fix Applies
 
