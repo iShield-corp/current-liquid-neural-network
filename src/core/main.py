@@ -2405,7 +2405,7 @@ class LiquidSpikingTrainer:
             train_loss, grad_norm = self.train_epoch(train_loader)
             
             # Validation phase
-            val_loss, val_accuracy = self.validate(val_loader)
+            val_loss, val_accuracy, is_best = self.validate(val_loader)
             
             # Learning rate scheduling
             self.scheduler.step()
