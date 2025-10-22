@@ -2415,7 +2415,7 @@ class LiquidSpikingTrainer:
             if hasattr(self, 'optimization_enhancement'):
                 # Adaptive learning rate based on loss and epoch
                 new_lr = self.optimization_enhancement.adaptive_learning_rate(
-                    self.optimizer, val_loss, epoch
+                    val_loss, epoch
                 )
                 
                 # Update surrogate gradient temperatures in model
