@@ -1936,13 +1936,14 @@ class LiquidSpikingTrainer:
             # Huber loss for robotics (more robust than MSE)
             self.criterion = nn.SmoothL1Loss(reduction='mean')
         
-        # Enhanced mixed precision with better settings
+        # Enhanced mixed precision with conservative settings to prevent gradient explosion
         self.scaler = GradScaler(
             device='cuda' if 'cuda' in self.config.device else 'cpu',
-            init_scale=2**16,
-            growth_factor=2.0,
+            init_scale=2**10,  # Much more conservative: 1024 instead of 65536
+            growth_factor=1.5,  # Slower growth to prevent instability
             backoff_factor=0.5,
-            growth_interval=100
+            growth_interval=200,  # Less frequent scaling adjustments
+            enabled=config.mixed_precision
         ) if config.mixed_precision else None
         
         # Training tracking
@@ -2082,9 +2083,20 @@ class LiquidSpikingTrainer:
                     outputs = self.model(data)
                     task_loss = self._compute_loss(outputs, targets)
                     
+                    # CRITICAL: Check for NaN loss
+                    if torch.isnan(task_loss):
+                        logger.error(
+                            f"❌ NaN loss detected at batch {batch_idx}! "
+                            f"Skipping batch."
+                        )
+                        continue
+                    
                     # Add consolidation loss for continual learning (NEW)
                     if self.continual_system is not None:
-                        consolidation_loss = self.continual_system.compute_consolidation_loss()
+                        consolidation_loss = (
+                            self.continual_system
+                            .compute_consolidation_loss()
+                        )
                         loss = task_loss + consolidation_loss
                     else:
                         loss = task_loss
@@ -2105,7 +2117,34 @@ class LiquidSpikingTrainer:
                             self.model.parameters(), 
                             self.config.gradient_clip
                         )
+                        
+                        # CRITICAL: Detect and handle gradient explosion
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(
+                                f"⚠️  Infinite gradient at batch {batch_idx}! "
+                                f"Skipping batch and resetting scaler."
+                            )
+                            self.optimizer.zero_grad()
+                            # Force scaler to reduce scale significantly
+                            self.scaler._scale = max(
+                                self.scaler._scale * 0.1, 1.0
+                            )
+                            accumulated_loss = 0
+                            continue
+                        
                         gradient_norm_sum += grad_norm.item()
+                        
+                        # Log gradient health periodically
+                        if batch_idx % 50 == 0:
+                            logger.info(
+                                f"📊 Batch {batch_idx}: "
+                                f"grad_norm={grad_norm:.3f}, "
+                                f"loss={accumulated_loss:.4f}"
+                            )
+                            if grad_norm > 10.0:
+                                logger.warning(
+                                    f"⚠️  High gradient norm: {grad_norm:.3f}"
+                                )
                     
                     # Optimizer step
                     self.scaler.step(self.optimizer)
@@ -2123,9 +2162,20 @@ class LiquidSpikingTrainer:
                 outputs = self.model(data)
                 task_loss = self._compute_loss(outputs, targets)
                 
+                # CRITICAL: Check for NaN loss
+                if torch.isnan(task_loss):
+                    logger.error(
+                        f"❌ NaN loss detected at batch {batch_idx}! "
+                        f"Skipping batch."
+                    )
+                    continue
+                
                 # Add consolidation loss for continual learning (NEW)
                 if self.continual_system is not None:
-                    consolidation_loss = self.continual_system.compute_consolidation_loss()
+                    consolidation_loss = (
+                        self.continual_system
+                        .compute_consolidation_loss()
+                    )
                     loss = task_loss + consolidation_loss
                 else:
                     loss = task_loss
@@ -2139,18 +2189,48 @@ class LiquidSpikingTrainer:
                     # Apply enhanced optimization techniques
                     if hasattr(self, 'optimization_enhancement'):
                         # Adaptive gradient clipping
-                        grad_norm, clip_value = self.optimization_enhancement.adaptive_gradient_clipping()
+                        grad_norm, clip_value = (
+                            self.optimization_enhancement
+                            .adaptive_gradient_clipping()
+                        )
+                        
+                        # CRITICAL: Detect gradient explosion
+                        if not torch.isfinite(
+                            torch.tensor(grad_norm)
+                        ):
+                            logger.warning(
+                                f"⚠️  Infinite gradient at batch {batch_idx}! "
+                                f"Skipping batch."
+                            )
+                            self.optimizer.zero_grad()
+                            accumulated_loss = 0
+                            continue
+                        
                         gradient_norm_sum += grad_norm
                         
                         # Add adaptive regularization to loss
-                        reg_loss = self.optimization_enhancement.compute_adaptive_regularization()
+                        reg_loss = (
+                            self.optimization_enhancement
+                            .compute_adaptive_regularization()
+                        )
                         loss = loss + reg_loss
                     elif self.config.gradient_clip > 0:
                         # Fallback to standard gradient clipping
                         grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), 
+                            self.model.parameters(),
                             self.config.gradient_clip
                         )
+                        
+                        # CRITICAL: Detect gradient explosion
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(
+                                f"⚠️  Infinite gradient at batch {batch_idx}! "
+                                f"Skipping batch."
+                            )
+                            self.optimizer.zero_grad()
+                            accumulated_loss = 0
+                            continue
+                        
                         gradient_norm_sum += grad_norm.item()
                     
                     self.optimizer.step()
