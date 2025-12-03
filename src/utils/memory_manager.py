@@ -28,17 +28,49 @@ class MemoryManager:
     - Context managers for safe memory operations
     """
     
-    def __init__(self, cleanup_threshold_mb: float = 500.0, auto_cleanup: bool = True):
+    def __init__(self, cleanup_threshold_mb: float = None, auto_cleanup: bool = True, 
+                 memory_reserve_percent: float = 0.15):
         """
-        Initialize memory manager.
+        Initialize memory manager with automatic GPU VRAM detection.
         
         Args:
-            cleanup_threshold_mb: Trigger cleanup when GPU memory exceeds this threshold (MB)
+            cleanup_threshold_mb: Trigger cleanup when GPU memory exceeds this threshold (MB).
+                                 If None, automatically set to 85% of total GPU VRAM.
             auto_cleanup: Whether to automatically cleanup memory periodically
+            memory_reserve_percent: Percentage of GPU memory to keep as safety buffer (default: 15%)
         """
-        self.cleanup_threshold_mb = cleanup_threshold_mb
         self.auto_cleanup = auto_cleanup
+        self.memory_reserve_percent = memory_reserve_percent
         self.logger = logging.getLogger(__name__)
+        
+        # Auto-detect GPU memory limits and set appropriate thresholds
+        self.gpu_total_memory_mb = {}
+        self.gpu_safe_threshold_mb = {}
+        
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                # Get total GPU memory
+                total_memory = torch.cuda.get_device_properties(i).total_memory
+                total_mb = total_memory / 1024 / 1024
+                self.gpu_total_memory_mb[i] = total_mb
+                
+                # Set safe threshold at 85% of total (leave 15% buffer)
+                safe_threshold = total_mb * (1.0 - memory_reserve_percent)
+                self.gpu_safe_threshold_mb[i] = safe_threshold
+                
+                self.logger.info(f"🎯 GPU {i} Memory Manager initialized:")
+                self.logger.info(f"   Total VRAM: {total_mb:.0f} MB")
+                self.logger.info(f"   Safe threshold: {safe_threshold:.0f} MB ({(1.0-memory_reserve_percent)*100:.0f}% of total)")
+                self.logger.info(f"   Reserved buffer: {total_mb * memory_reserve_percent:.0f} MB ({memory_reserve_percent*100:.0f}%)")
+        
+        # Set cleanup threshold (use provided value or auto-detected)
+        if cleanup_threshold_mb is not None:
+            self.cleanup_threshold_mb = cleanup_threshold_mb
+        elif self.gpu_safe_threshold_mb:
+            # Use the threshold for GPU 0 as default
+            self.cleanup_threshold_mb = self.gpu_safe_threshold_mb.get(0, 500.0)
+        else:
+            self.cleanup_threshold_mb = 500.0  # Fallback for CPU-only
         
         # Memory tracking
         self.initial_memory = self._get_memory_info()
@@ -92,13 +124,18 @@ class MemoryManager:
         self._cleanup_thread.start()
     
     def _should_cleanup(self) -> bool:
-        """Check if cleanup should be triggered."""
+        """Check if cleanup should be triggered based on GPU-specific thresholds."""
         if not torch.cuda.is_available():
             return False
         
         for i in range(torch.cuda.device_count()):
             allocated_mb = torch.cuda.memory_allocated(i) / 1024 / 1024
-            if allocated_mb > self.cleanup_threshold_mb:
+            
+            # Get GPU-specific threshold (or use default)
+            threshold = self.gpu_safe_threshold_mb.get(i, self.cleanup_threshold_mb)
+            
+            if allocated_mb > threshold:
+                self.logger.debug(f"GPU {i} memory ({allocated_mb:.0f}MB) exceeds threshold ({threshold:.0f}MB)")
                 return True
         
         return False
@@ -140,7 +177,7 @@ class MemoryManager:
                                f"GPU memory: {memory_info.get('gpu_0_allocated_mb', 0):.1f}MB")
     
     def get_memory_report(self) -> str:
-        """Generate detailed memory usage report."""
+        """Generate detailed memory usage report with GPU-specific thresholds."""
         current = self._get_memory_info()
         
         report = []
@@ -151,7 +188,13 @@ class MemoryManager:
             for i in range(torch.cuda.device_count()):
                 allocated = current.get(f'gpu_{i}_allocated_mb', 0)
                 reserved = current.get(f'gpu_{i}_reserved_mb', 0)
-                report.append(f"GPU {i}: {allocated:.1f}MB allocated, {reserved:.1f}MB reserved")
+                total = self.gpu_total_memory_mb.get(i, 0)
+                threshold = self.gpu_safe_threshold_mb.get(i, 0)
+                
+                usage_percent = (allocated / total * 100) if total > 0 else 0
+                
+                report.append(f"GPU {i}: {allocated:.1f}MB / {total:.0f}MB ({usage_percent:.1f}%)")
+                report.append(f"       Reserved: {reserved:.1f}MB, Threshold: {threshold:.0f}MB")
         
         report.append(f"Cleanup operations: {self.cleanup_count}")
         report.append(f"Tracked tensors: {len(self._tracked_tensors)}")
@@ -159,7 +202,7 @@ class MemoryManager:
         return "\n".join(report)
     
     def log_memory_usage(self, step_name: str = ""):
-        """Log current memory usage with optional step name."""
+        """Log current memory usage with GPU utilization percentage."""
         memory_info = self._get_memory_info()
         
         # Update peak memory
@@ -170,8 +213,20 @@ class MemoryManager:
         gpu_mem = memory_info.get('gpu_0_allocated_mb', 0)
         cpu_mem = memory_info['cpu_memory_mb']
         
+        # Calculate GPU utilization percentage
+        gpu_total = self.gpu_total_memory_mb.get(0, 0)
+        gpu_percent = (gpu_mem / gpu_total * 100) if gpu_total > 0 else 0
+        gpu_threshold = self.gpu_safe_threshold_mb.get(0, 0)
+        
+        # Warning if approaching threshold
+        warning = ""
+        if gpu_percent > 80:
+            warning = " ⚠️ HIGH"
+        elif gpu_percent > 90:
+            warning = " 🔴 CRITICAL"
+        
         self.logger.info(f"Memory usage{' (' + step_name + ')' if step_name else ''}: "
-                        f"GPU: {gpu_mem:.1f}MB, CPU: {cpu_mem:.1f}MB")
+                        f"GPU: {gpu_mem:.1f}MB ({gpu_percent:.1f}%{warning}), CPU: {cpu_mem:.1f}MB")
     
     @contextmanager
     def memory_scope(self, name: str = "operation"):
@@ -298,10 +353,15 @@ class SpikingMemoryManager(MemoryManager):
 _global_memory_manager = None
 
 def get_memory_manager() -> MemoryManager:
-    """Get global memory manager instance."""
+    """Get global memory manager instance with auto-configured GPU thresholds."""
     global _global_memory_manager
     if _global_memory_manager is None:
-        _global_memory_manager = SpikingMemoryManager()
+        # Auto-detect GPU and configure appropriate thresholds
+        _global_memory_manager = SpikingMemoryManager(
+            cleanup_threshold_mb=None,  # Auto-detect based on GPU VRAM
+            auto_cleanup=True,
+            memory_reserve_percent=0.15  # Keep 15% buffer
+        )
     return _global_memory_manager
 
 def set_memory_manager(manager: MemoryManager):
@@ -353,3 +413,61 @@ def log_memory(step_name: str = ""):
 def cleanup_memory(force: bool = False):
     """Cleanup memory."""
     get_memory_manager().cleanup_memory(force)
+
+def get_gpu_memory_info() -> Dict[str, Any]:
+    """
+    Get detailed GPU memory information for all available devices.
+    
+    Returns:
+        Dictionary with GPU memory info including total, available, and thresholds
+    """
+    info = {
+        'available': torch.cuda.is_available(),
+        'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        'devices': []
+    }
+    
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            total_mb = props.total_memory / 1024 / 1024
+            allocated_mb = torch.cuda.memory_allocated(i) / 1024 / 1024
+            reserved_mb = torch.cuda.memory_reserved(i) / 1024 / 1024
+            free_mb = total_mb - allocated_mb
+            
+            # Calculate safe threshold (85% of total)
+            safe_threshold_mb = total_mb * 0.85
+            
+            device_info = {
+                'id': i,
+                'name': props.name,
+                'total_mb': total_mb,
+                'allocated_mb': allocated_mb,
+                'reserved_mb': reserved_mb,
+                'free_mb': free_mb,
+                'safe_threshold_mb': safe_threshold_mb,
+                'utilization_percent': (allocated_mb / total_mb * 100) if total_mb > 0 else 0
+            }
+            info['devices'].append(device_info)
+    
+    return info
+
+def print_gpu_memory_info():
+    """Print formatted GPU memory information to console."""
+    info = get_gpu_memory_info()
+    
+    if not info['available']:
+        print("⚠️  No CUDA GPUs available")
+        return
+    
+    print(f"\n🎯 GPU Memory Configuration:")
+    print(f"   Found {info['device_count']} CUDA device(s)")
+    
+    for dev in info['devices']:
+        print(f"\n   GPU {dev['id']}: {dev['name']}")
+        print(f"      Total VRAM: {dev['total_mb']:.0f} MB")
+        print(f"      Currently allocated: {dev['allocated_mb']:.0f} MB ({dev['utilization_percent']:.1f}%)")
+        print(f"      Free: {dev['free_mb']:.0f} MB")
+        print(f"      Safe threshold: {dev['safe_threshold_mb']:.0f} MB (85% of total)")
+        print(f"      Reserved buffer: {dev['total_mb'] - dev['safe_threshold_mb']:.0f} MB (15%)")
+    print()

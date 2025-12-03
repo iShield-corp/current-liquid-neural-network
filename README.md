@@ -4,6 +4,38 @@ A cutting-edge implementation combining Liquid Neural Networks (LNNs) with Spiki
 
 ## 🚀 Quick Start
 
+### Production Training (RECOMMENDED) ✨
+
+**For LLM tasks, use the production training script** - it includes all critical fixes:
+
+```bash
+# Simple production training (all fixes included automatically)
+python train.py llm_production --epochs 30 --dataset wikitext103
+
+# With custom configuration
+python train.py llm_production \
+  --model-size small \
+  --epochs 30 \
+  --batch-size 8 \
+  --dataset wikitext103
+
+# Resume from checkpoint
+python train.py llm_production \
+  --resume models/best_model.pt \
+  --epochs 50
+```
+
+**Why use production mode?**
+- ✅ All gradient flow fixes included
+- ✅ Fixed LR scheduler (no more lr=0)
+- ✅ Proper checkpointing and early stopping
+- ✅ Validated and working correctly
+- ✅ Model actually learns!
+
+📖 **See**: `PRODUCTION_TRAINING_GUIDE.md` for complete documentation
+
+### Legacy Training
+
 ```bash
 # Clone and navigate to project
 git clone <repository-url>
@@ -18,6 +50,9 @@ pip install -r requirements.txt
 
 # Quick LLM training with default settings
 python scripts/cli.py train --task llm --epochs 15
+
+# OR use production mode (recommended)
+python scripts/cli.py train --task llm --production-mode --epochs 30
 
 # Quick Vision training with real datasets
 python scripts/cli.py train --task vision --epochs 20

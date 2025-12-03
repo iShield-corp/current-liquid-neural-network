@@ -738,9 +738,10 @@ class SpikingEncoder(nn.Module):
         self.num_steps = num_steps
         self.fc1 = nn.Linear(input_dim, output_dim * 2)
         self.fc2 = nn.Linear(output_dim * 2, output_dim)
-        self.lif1 = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid())
-        self.lif2 = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid())
-        self.dropout = nn.Dropout(0.2)
+        # CRITICAL FIX: Use slope=25 for stronger gradients (prevents vanishing)
+        self.lif1 = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(slope=25))
+        self.lif2 = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(slope=25))
+        self.dropout = nn.Dropout(0.1)  # Reduced from 0.2
         
         # Track membrane potential for normalization
         self.membrane_potential = None
@@ -1249,6 +1250,7 @@ class LiquidSpikingNetwork(nn.Module):
         super().__init__()
         self.config = config
         self.task_type = config.task_type
+        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', False)
         
         # Task-specific input processing
         if self.task_type == TaskType.LLM:
@@ -1563,6 +1565,22 @@ class LiquidSpikingNetwork(nn.Module):
         
         # Process through hybrid liquid-spiking blocks with proper residual handling
         for i, (block, norm) in enumerate(zip(self.hybrid_blocks, self.layer_norms)):
+            if self.use_gradient_checkpointing and self.training:
+                # Use gradient checkpointing to save memory (trades compute for memory)
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs, return_internals=True)
+                    return custom_forward
+                
+                result = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x,
+                    hidden_states[i],
+                    use_reentrant=False
+                )
+            else:
+                result = block(x, hidden_states[i], return_internals=True)
+            
             if self.task_type == TaskType.LLM:
                 # For LLM, process the entire sequence at once
                 residual = x
@@ -1894,21 +1912,25 @@ class LiquidSpikingTrainer:
         )
         
         # Advanced learning rate scheduling with warmup
-        self.warmup_epochs = max(1, config.num_epochs // 20)  # 5% warmup
+        self.warmup_epochs = max(1, config.num_epochs // 20)  # 5% warmup, minimum 1 epoch
         self.total_epochs = getattr(config, 'num_epochs', 100)
         
         # Create combined scheduler: warmup + cosine annealing with restarts
         def lr_lambda(epoch):
-            if epoch < self.warmup_epochs:
-                # Linear warmup
-                return epoch / self.warmup_epochs
+            # CRITICAL FIX: Ensure warmup_epochs is never 0
+            warmup = max(1, self.warmup_epochs)
+            
+            if epoch < warmup:
+                # Linear warmup - CRITICAL FIX: Start from small value, not 0
+                # This prevents LR from being 0 at epoch 0
+                return max(0.1, (epoch + 1) / warmup)
             else:
                 # Cosine annealing with restarts
-                cycle_length = (self.total_epochs - self.warmup_epochs) // 3
+                cycle_length = (self.total_epochs - warmup) // 3
                 if cycle_length < 1:
-                    cycle_length = self.total_epochs - self.warmup_epochs
+                    cycle_length = max(1, self.total_epochs - warmup)
                 
-                epoch_in_cycle = (epoch - self.warmup_epochs) % cycle_length
+                epoch_in_cycle = (epoch - warmup) % cycle_length
                 return 0.5 * (1 + math.cos(math.pi * epoch_in_cycle / cycle_length))
         
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
@@ -2261,19 +2283,35 @@ class LiquidSpikingTrainer:
                     accumulated_loss = 0
                     num_batches += 1
             
-            # Memory cleanup to prevent leaks
+            # Memory cleanup to prevent leaks - CRITICAL FOR LONG TRAINING
             if batch_idx % memory_cleanup_interval == 0 and batch_idx > 0:
-                # Use memory manager for cleanup
-                self.memory_manager.cleanup_memory()
-                # Explicit cleanup of intermediate tensors
-                del data, targets, outputs, loss
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                
+                # Use memory manager for cleanup (don't delete tensors explicitly)
+                if hasattr(self, 'memory_manager'):
+                    self.memory_manager.cleanup_memory()
+                
+                # Log memory usage every 10 cleanup intervals
+                if batch_idx % (memory_cleanup_interval * 10) == 0:
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / 1024**3
+                        reserved = torch.cuda.memory_reserved() / 1024**3
+                        logger.info(f"🔍 Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
                     
             # Update progress bar with detailed metrics (only on main process)
-            if show_progress and hasattr(progress_bar, 'set_postfix') and num_batches > 0:
+            if show_progress and hasattr(progress_bar, 'set_postfix'):
                 current_lr = self.optimizer.param_groups[0]['lr']
-                avg_grad_norm = gradient_norm_sum / num_batches if num_batches > 0 else 0
+                avg_grad_norm = gradient_norm_sum / max(num_batches, 1)
+                avg_loss_display = total_loss / max(num_batches, 1) if num_batches > 0 else accumulated_loss
                 progress_bar.set_postfix({
-                    'loss': f'{total_loss/num_batches:.4f}',
+                    'loss': f'{avg_loss_display:.4f}',
                     'lr': f'{current_lr:.2e}',
                     'grad_norm': f'{avg_grad_norm:.3f}',
                     'gpus': len(self.gpu_ids) if self.gpu_ids else 0
@@ -2323,9 +2361,25 @@ class LiquidSpikingTrainer:
         self.train_losses.append(avg_loss)
         self.learning_rates.append(self.optimizer.param_groups[0]['lr'])
         
-        # End-of-epoch memory cleanup
-        self.memory_manager.cleanup_memory()
-        self.memory_manager.log_memory_usage("End of training epoch")
+        # CRITICAL: Aggressive end-of-epoch memory cleanup
+        # This prevents gradual memory accumulation over many epochs
+        
+        # Clear any cached tensors
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Force Python garbage collection
+        import gc
+        gc.collect()
+        
+        # Use memory manager cleanup
+        if hasattr(self, 'memory_manager'):
+            self.memory_manager.cleanup_memory(force=True)
+            self.memory_manager.log_memory_usage("End of training epoch")
+        
+        # Zero gradients to release any lingering references
+        self.optimizer.zero_grad(set_to_none=True)
         
         return avg_loss, avg_grad_norm
     
@@ -2334,24 +2388,40 @@ class LiquidSpikingTrainer:
         if self.config.task_type == TaskType.LLM:
             # Reshape for cross-entropy loss
             batch_size, seq_len, vocab_size = outputs.shape
-            outputs = outputs.reshape(-1, vocab_size)
-            targets = targets.reshape(-1)
+            
+            # Ensure targets match outputs sequence length
+            if targets.shape[1] != seq_len:
+                if targets.shape[1] > seq_len:
+                    targets = targets[:, :seq_len]
+                else:
+                    # Pad targets if shorter
+                    padding = torch.full(
+                        (batch_size, seq_len - targets.shape[1]),
+                        -100,
+                        dtype=targets.dtype,
+                        device=targets.device
+                    )
+                    targets = torch.cat([targets, padding], dim=1)
+            
+            outputs_flat = outputs.reshape(-1, vocab_size)
+            targets_flat = targets.reshape(-1)
             
             # Ignore padding tokens
-            valid_indices = targets != -100
+            valid_indices = targets_flat != -100
             if valid_indices.any():
-                outputs = outputs[valid_indices]
-                targets = targets[valid_indices]
+                outputs_flat = outputs_flat[valid_indices]
+                targets_flat = targets_flat[valid_indices]
             else:
                 # Fallback if all tokens are padding
                 return torch.tensor(0.0, device=outputs.device, requires_grad=True)
             
-            loss = self.criterion(outputs, targets)
+            loss = self.criterion(outputs_flat, targets_flat)
             
-            # Add regularization for stability
+            # CRITICAL: Detach regularization to prevent memory leaks
             if hasattr(self.model, 'token_embedding'):
-                # Embedding regularization
-                embed_reg = 0.01 * torch.norm(self.model.token_embedding.weight, p=2)
+                # Embedding regularization - detach to prevent graph accumulation
+                embed_weight = self.model.token_embedding.weight
+                embed_reg = 0.01 * torch.norm(embed_weight.detach(), p=2)
                 loss = loss + embed_reg
                 
         elif self.config.task_type == TaskType.VISION:
@@ -2402,7 +2472,8 @@ class LiquidSpikingTrainer:
                 outputs = self.model(data)
                 loss = self._compute_loss(outputs, targets)
                 
-                total_loss += loss.item()
+                # CRITICAL: Detach loss to prevent memory accumulation
+                total_loss += loss.detach().item()
                 num_batches += 1
                 
                 # Calculate accuracy for classification tasks
@@ -2416,15 +2487,21 @@ class LiquidSpikingTrainer:
                         valid_indices = targets_flat != -100
                         if valid_indices.any():
                             predictions = outputs_flat[valid_indices].argmax(dim=-1)
-                            correct = (predictions == targets_flat[valid_indices]).sum().item()
+                            # Detach to prevent memory leaks
+                            correct = (predictions == targets_flat[valid_indices]).sum().detach().item()
                             total_correct += correct
                             total_samples += valid_indices.sum().item()
                     else:
                         # Vision classification
                         predictions = outputs.argmax(dim=-1)
-                        correct = (predictions == targets).sum().item()
+                        correct = (predictions == targets).sum().detach().item()
                         total_correct += correct
                         total_samples += targets.size(0)
+                
+                # Periodic cleanup during validation to prevent memory buildup
+                if num_batches % 100 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         
         avg_loss = total_loss / max(num_batches, 1)
         accuracy = total_correct / max(total_samples, 1) if total_samples > 0 else 0.0
@@ -2448,6 +2525,14 @@ class LiquidSpikingTrainer:
                     param.data.copy_(original_state[name])
         
         self.val_losses.append(avg_loss)
+        
+        # CRITICAL: Cleanup after validation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        import gc
+        gc.collect()
         
         # Update best model tracking
         is_best = avg_loss < self.best_val_loss
@@ -2481,15 +2566,23 @@ class LiquidSpikingTrainer:
             if hasattr(train_loader.sampler, 'set_epoch'):
                 train_loader.sampler.set_epoch(epoch)
             
+            # Learning rate scheduling - CRITICAL: Do this BEFORE training
+            # so LR is set correctly for the epoch (especially epoch 0)
+            if epoch > 0:  # Don't step on first epoch
+                self.scheduler.step()
+            
+            # Get LR for logging (before any changes)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
             # Training phase
             train_loss, grad_norm = self.train_epoch(train_loader)
             
             # Validation phase
             val_loss, val_accuracy, is_best = self.validate(val_loader)
             
-            # Learning rate scheduling
-            self.scheduler.step()
-            self.plateau_scheduler.step(val_loss)
+            # Plateau scheduler steps after validation
+            if epoch > 0:  # Don't step on first epoch
+                self.plateau_scheduler.step(val_loss)
             
             # Apply enhanced optimization techniques
             if hasattr(self, 'optimization_enhancement'):
@@ -2516,7 +2609,7 @@ class LiquidSpikingTrainer:
                     print(f"  🎯 Val Accuracy: {val_accuracy:.2%}")
                 print(f"  📈 Grad Norm: {grad_norm:.3f}")
                 print(f"  ⏱️  Time: {epoch_time:.1f}s")
-                print(f"  📚 LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+                print(f"  📚 LR: {current_lr:.2e}")
                 
                 # Save checkpoint every 5 epochs or if best model
                 is_best = val_loss < self.best_val_loss
@@ -2877,15 +2970,54 @@ class TextDataset(Dataset):
         )
 
 class WikiTextDataset:
-    """Download and process WikiText-2 dataset for LLM training."""
+    """Download and process WikiText and other high-quality datasets for LLM training.
+    
+    Supports multiple datasets:
+    - WikiText-103: ~100M tokens (RECOMMENDED for 100M+ parameter models)
+    - WikiText-2: ~2M tokens (only for tiny models <10M parameters)
+    - BookCorpus: Large book text corpus for diverse language patterns
+    - CC-News: News articles for factual content
+    - OpenWebText: Web content for general knowledge
+    - Combined: Multiple datasets mixed for maximum diversity
+    """
+    
+    @staticmethod
+    def load_wikitext103(split='train', cache_dir='./data'):
+        """Load WikiText-103 dataset (~100M tokens).
+        
+        This is 50x larger than WikiText-2 and RECOMMENDED for models with 100M+ parameters.
+        Provides sufficient data for proper language learning.
+        """
+        try:
+            # Try to load from HuggingFace datasets
+            logger.info(f"Loading WikiText-103 ({split} split)...")
+            dataset = load_dataset('wikitext', 'wikitext-103-raw-v1', split=split, cache_dir=cache_dir)
+            texts = [example['text'] for example in dataset if len(example['text'].strip()) > 50]
+            logger.info(f"✅ WikiText-103 loaded: {len(texts):,} texts (~100M tokens)")
+            return texts
+        except Exception as e:
+            logger.warning(f"Failed to load WikiText-103 from HuggingFace: {e}")
+            logger.info("Falling back to sample text generation...")
+            return WikiTextDataset._create_sample_text()
     
     @staticmethod
     def load_wikitext2(split='train', cache_dir='./data'):
-        """Load WikiText-2 dataset."""
+        """Load WikiText-2 dataset (~2M tokens).
+        
+        WARNING: This dataset is VERY SMALL (only ~2M tokens) and only suitable 
+        for tiny models (<10M parameters). For 100M+ parameter models, this will
+        cause the model to produce gibberish instead of coherent text.
+        
+        USE WikiText-103 or combined datasets instead for proper training!
+        """
         try:
             # Try to load from HuggingFace datasets
+            logger.warning("⚠️ Loading WikiText-2 (VERY SMALL dataset)")
+            logger.warning("⚠️ WikiText-2 is TOO SMALL for models >10M parameters!")
+            logger.warning("⚠️ Consider using WikiText-103 or combined datasets instead!")
             dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split=split, cache_dir=cache_dir)
             texts = [example['text'] for example in dataset if len(example['text'].strip()) > 50]
+            logger.info(f"WikiText-2 loaded: {len(texts)} texts (~2M tokens)")
             return texts
         except Exception as e:
             print(f"Failed to load from HuggingFace: {e}")
@@ -2957,17 +3089,242 @@ class WikiTextDataset:
                 expanded_texts.append(f"{text} This is sample text number {i+1} for training purposes. " * 3)
         
         return expanded_texts
+    
+    @staticmethod
+    def load_bookcorpus(split='train', cache_dir='./data', max_texts=50000):
+        """Load BookCorpus dataset for diverse language patterns from books.
+        
+        BookCorpus contains text from 11,038 books covering diverse genres.
+        Excellent for learning narrative structure and diverse vocabulary.
+        Note: Using bookcorpusopen which works with modern datasets library.
+        """
+        try:
+            logger.info(f"Loading BookCorpus ({split} split)...")
+            # Use alternative repository that works with modern datasets library
+            dataset = load_dataset('bookcorpusopen', split=split, cache_dir=cache_dir)
+            texts = [example['text'] for example in dataset if len(example['text'].strip()) > 50]
+            # Limit to max_texts to avoid memory issues
+            if len(texts) > max_texts:
+                logger.info(f"Limiting BookCorpus to {max_texts:,} texts")
+                texts = texts[:max_texts]
+            logger.info(f"✅ BookCorpus loaded: {len(texts):,} texts")
+            return texts
+        except Exception as e:
+            logger.warning(f"Failed to load BookCorpus: {e}")
+            logger.info("Skipping BookCorpus - using other datasets only")
+            return []
+    
+    @staticmethod
+    def load_cc_news(split='train', cache_dir='./data', max_texts=50000):
+        """Load CC-News dataset (news articles from Common Crawl).
+        
+        Contains news articles for factual content and current events vocabulary.
+        """
+        try:
+            logger.info(f"Loading CC-News ({split} split)...")
+            dataset = load_dataset('cc_news', split=split, cache_dir=cache_dir)
+            texts = [example['text'] for example in dataset if len(example['text'].strip()) > 50]
+            if len(texts) > max_texts:
+                logger.info(f"Limiting CC-News to {max_texts:,} texts")
+                texts = texts[:max_texts]
+            logger.info(f"✅ CC-News loaded: {len(texts):,} texts")
+            return texts
+        except Exception as e:
+            logger.warning(f"Failed to load CC-News: {e}")
+            return []
+    
+    @staticmethod
+    def load_openwebtext(split='train', cache_dir='./data', max_texts=50000):
+        """Load OpenWebText dataset (web content similar to WebText used by GPT-2).
+        
+        High-quality web content covering diverse topics and writing styles.
+        Note: Using Skylion007/openwebtext which has been converted to Parquet.
+        """
+        try:
+            logger.info(f"Loading OpenWebText ({split} split)...")
+            # Use the Parquet-converted version that works with modern datasets library
+            dataset = load_dataset('Skylion007/openwebtext', split=split, cache_dir=cache_dir)
+            texts = [example['text'] for example in dataset if len(example['text'].strip()) > 50]
+            if len(texts) > max_texts:
+                logger.info(f"Limiting OpenWebText to {max_texts:,} texts")
+                texts = texts[:max_texts]
+            logger.info(f"✅ OpenWebText loaded: {len(texts):,} texts")
+            return texts
+        except Exception as e:
+            logger.warning(f"Failed to load OpenWebText: {e}")
+            logger.info("Trying alternative OpenWebText repository...")
+            try:
+                # Fallback to alternative mirror (smaller subset)
+                dataset = load_dataset('stas/openwebtext-10k', split=split, cache_dir=cache_dir)
+                texts = [example['text'] for example in dataset if len(example['text'].strip()) > 50]
+                logger.info(f"✅ OpenWebText (10k subset) loaded: {len(texts):,} texts")
+                return texts
+            except Exception as e2:
+                logger.warning(f"Alternative also failed: {e2}")
+                logger.info("Skipping OpenWebText - using other datasets only")
+                return []
+    
+    @staticmethod
+    def load_programming_samples(cache_dir='./data'):
+        """Load programming code samples for code understanding.
+        
+        Returns:
+            List of code samples and programming-related text
+        """
+        try:
+            logger.info("💻 Loading programming dataset...")
+            
+            # Try loading from cache first
+            programming_cache = os.path.join(cache_dir, 'programming_dataset_cache')
+            if os.path.exists(programming_cache):
+                cache_files = [f for f in os.listdir(programming_cache) if f.endswith('.txt')]
+                if cache_files:
+                    texts = []
+                    for cache_file in cache_files:
+                        with open(os.path.join(programming_cache, cache_file), 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            if len(content.strip()) > 50:
+                                texts.append(content)
+                    
+                    if texts:
+                        logger.info(f"✅ Loaded {len(texts):,} programming samples from cache")
+                        return texts
+            
+            # If no cache, try advanced programming dataset
+            try:
+                from ..datasets.advanced_programming_datasets import ProgrammingDatasetFactory
+                
+                # Generate sample programming texts
+                sample_texts = []
+                for _ in range(1000):  # Generate 1000 code samples
+                    code_sample = ProgrammingDatasetFactory._generate_sample_code()
+                    sample_texts.append(code_sample)
+                
+                logger.info(f"✅ Generated {len(sample_texts):,} programming samples")
+                return sample_texts
+                
+            except ImportError:
+                logger.warning("Advanced programming dataset not available")
+                # Fallback to basic code samples
+                return WikiTextDataset._create_basic_programming_samples()
+                
+        except Exception as e:
+            logger.warning(f"Failed to load programming dataset: {e}")
+            return WikiTextDataset._create_basic_programming_samples()
+    
+    @staticmethod
+    def _create_basic_programming_samples():
+        """Create basic programming samples as fallback."""
+        samples = [
+            "def hello_world():\n    print('Hello, World!')\n    return True",
+            "class Node:\n    def __init__(self, value):\n        self.value = value\n        self.next = None",
+            "for i in range(10):\n    if i % 2 == 0:\n        print(f'Even: {i}')",
+            "import numpy as np\ndef matrix_multiply(a, b):\n    return np.dot(a, b)",
+            "async def fetch_data(url):\n    response = await client.get(url)\n    return response.json()",
+        ] * 200  # Repeat to get 1000 samples
+        
+        logger.info(f"✅ Created {len(samples):,} basic programming samples")
+        return samples
+    
+    @staticmethod
+    def load_combined_dataset(datasets=['wikitext103'], split='train', cache_dir='./data'):
+        """Load and combine multiple datasets for maximum diversity.
+        
+        Args:
+            datasets: List of dataset names. Options:
+                - 'wikitext103': WikiText-103 (~100M tokens) - RECOMMENDED
+                - 'wikitext2': WikiText-2 (~2M tokens) - NOT RECOMMENDED
+                - 'bookcorpus': Books corpus
+                - 'ccnews': News articles
+                - 'openwebtext': Web content
+                - 'programming': Programming code samples
+            split: Dataset split ('train', 'validation', or 'test')
+            cache_dir: Directory to cache downloaded datasets
+        
+        Returns:
+            Combined list of texts from all datasets
+        
+        Example:
+            # Recommended combination for 100M+ parameter models:
+            texts = load_combined_dataset(['programming', 'wikitext103', 'bookcorpus', 'openwebtext'])
+        """
+        all_texts = []
+        
+        for dataset_name in datasets:
+            try:
+                if dataset_name == 'wikitext103':
+                    texts = WikiTextDataset.load_wikitext103(split, cache_dir)
+                elif dataset_name == 'wikitext2':
+                    logger.warning("⚠️ WikiText-2 is very small - consider using wikitext103 instead")
+                    texts = WikiTextDataset.load_wikitext2(split, cache_dir)
+                elif dataset_name == 'bookcorpus':
+                    texts = WikiTextDataset.load_bookcorpus(split, cache_dir)
+                elif dataset_name == 'ccnews':
+                    texts = WikiTextDataset.load_cc_news(split, cache_dir)
+                elif dataset_name == 'openwebtext':
+                    texts = WikiTextDataset.load_openwebtext(split, cache_dir)
+                elif dataset_name == 'programming':
+                    logger.info("💻 Loading programming dataset...")
+                    texts = WikiTextDataset.load_programming_samples(cache_dir)
+                else:
+                    logger.warning(f"Unknown dataset: {dataset_name}, skipping")
+                    continue
+                
+                all_texts.extend(texts)
+                logger.info(f"Added {len(texts):,} texts from {dataset_name}")
+                
+            except Exception as e:
+                logger.error(f"Failed to load {dataset_name}: {e}")
+                continue
+        
+        if not all_texts:
+            logger.warning("No datasets loaded successfully! Using sample text...")
+            all_texts = WikiTextDataset._create_sample_text()
+        else:
+            logger.info(f"✅ Combined dataset loaded: {len(all_texts):,} total texts")
+        
+        # Shuffle for diversity
+        import random
+        random.shuffle(all_texts)
+        
+        return all_texts
 
 class DatasetFactory:
     @staticmethod
-    def create_llm_dataset(vocab_size=100277, seq_length=128, num_samples=50000, tokenizer_name='gpt4', tokenizer_type=None):
-        """Create LLM dataset with robust tokenizer validation and token ID safety."""
+    def create_llm_dataset(vocab_size=100277, seq_length=128, num_samples=50000, 
+                          tokenizer_name='gpt4', tokenizer_type=None, 
+                          dataset_type='wikitext103', combined_datasets=None, 
+                          cache_dir='./data'):
+        """Create LLM dataset with robust tokenizer validation and token ID safety.
+        
+        Args:
+            vocab_size: Target vocabulary size
+            seq_length: Sequence length for training
+            num_samples: Number of samples (used for programming dataset)
+            tokenizer_name: Name of tokenizer to use
+            tokenizer_type: Alternative name for tokenizer (backward compatibility)
+            dataset_type: Type of dataset to load. Options:
+                - 'programming': Programming code dataset (old default)
+                - 'wikitext103': WikiText-103 (~100M tokens) - RECOMMENDED
+                - 'wikitext2': WikiText-2 (~2M tokens) - TOO SMALL for large models
+                - 'bookcorpus': Books corpus
+                - 'ccnews': News articles
+                - 'openwebtext': Web content
+                - 'combined': Multiple datasets mixed
+            combined_datasets: List of datasets for 'combined' mode
+            cache_dir: Directory to cache downloaded datasets
+        """
         
         # Handle both parameter names for backward compatibility
         tokenizer_name = tokenizer_type or tokenizer_name
         
-        logger.info(f"Creating LLM dataset with {tokenizer_name} tokenizer")
-        logger.info(f"Target vocab size: {vocab_size:,}, sequence length: {seq_length}")
+        logger.info("="*70)
+        logger.info("🗂️  DATASET CONFIGURATION")
+        logger.info("="*70)
+        logger.info(f"📊 Dataset type: {dataset_type}")
+        logger.info(f"🔤 Tokenizer: {tokenizer_name}")
+        logger.info(f"📏 Target vocab size: {vocab_size:,}")
+        logger.info(f"📐 Sequence length: {seq_length}")
         
         # Create tokenizer with validation
         if tokenizer_name in ['gpt4', 'gpt3', 'o200k']:
@@ -2998,9 +3355,110 @@ class DatasetFactory:
                 tokenizer.pad_token = tokenizer.eos_token
             vocab_size = len(tokenizer)
         
-        logger.info(f"Final tokenizer vocab size: {vocab_size:,}")
+        logger.info(f"✅ Tokenizer loaded: {vocab_size:,} vocab size")
         
-        # Load dataset with proper error handling
+        # Load dataset based on type
+        logger.info("="*70)
+        logger.info("📥 LOADING DATASET")
+        logger.info("="*70)
+        
+        texts = None
+        
+        if dataset_type == 'wikitext103':
+            logger.info("📚 Loading WikiText-103 dataset...")
+            logger.info("   • Size: ~100M tokens (50x larger than WikiText-2)")
+            logger.info("   • Recommended for: 100M+ parameter models")
+            texts = WikiTextDataset.load_wikitext103(split='train', cache_dir=cache_dir)
+            
+        elif dataset_type == 'wikitext2':
+            logger.warning("⚠️  Loading WikiText-2 dataset...")
+            logger.warning("   • Size: ~2M tokens (VERY SMALL!)")
+            logger.warning("   • Only suitable for: <10M parameter models")
+            logger.warning("   • For large models, use wikitext103 or combined instead!")
+            texts = WikiTextDataset.load_wikitext2(split='train', cache_dir=cache_dir)
+            
+        elif dataset_type == 'bookcorpus':
+            logger.info("📖 Loading BookCorpus dataset...")
+            logger.info("   • Content: 11,038 books with diverse genres")
+            logger.info("   • Good for: Narrative structure and vocabulary")
+            texts = WikiTextDataset.load_bookcorpus(split='train', cache_dir=cache_dir)
+            
+        elif dataset_type == 'ccnews':
+            logger.info("📰 Loading CC-News dataset...")
+            logger.info("   • Content: News articles from Common Crawl")
+            logger.info("   • Good for: Factual content and current events")
+            texts = WikiTextDataset.load_cc_news(split='train', cache_dir=cache_dir)
+            
+        elif dataset_type == 'openwebtext':
+            logger.info("🌐 Loading OpenWebText dataset...")
+            logger.info("   • Content: High-quality web content")
+            logger.info("   • Good for: General knowledge and diverse topics")
+            texts = WikiTextDataset.load_openwebtext(split='train', cache_dir=cache_dir)
+            
+        elif dataset_type == 'combined':
+            if combined_datasets is None:
+                combined_datasets = ['wikitext103', 'bookcorpus', 'openwebtext']
+            logger.info("🔀 Loading COMBINED datasets...")
+            logger.info(f"   • Datasets: {', '.join(combined_datasets)}")
+            logger.info("   • Expected size: 200M+ tokens")
+            logger.info("   • Best quality training data!")
+            texts = WikiTextDataset.load_combined_dataset(
+                datasets=combined_datasets, 
+                split='train', 
+                cache_dir=cache_dir
+            )
+            
+        elif dataset_type == 'programming':
+            logger.info("💻 Loading programming dataset...")
+            logger.info("   • Content: Code samples and programming text")
+            # Fall through to old implementation below
+        
+        else:
+            logger.error(f"Unknown dataset type: {dataset_type}")
+            logger.info("Falling back to programming dataset...")
+            dataset_type = 'programming'
+        
+        # If we loaded text data, create TextDataset
+        if texts is not None:
+            logger.info("="*70)
+            logger.info(f"✅ Dataset loaded successfully!")
+            logger.info(f"   • Total texts: {len(texts):,}")
+            logger.info(f"   • Creating tokenized dataset...")
+            logger.info("="*70)
+            
+            dataset = TextDataset(texts, tokenizer, seq_length)
+            logger.info(f"✅ Tokenized dataset ready: {len(dataset):,} samples")
+            
+            # Add token validation to dataset
+            class ValidatedDataset(Dataset):
+                def __init__(self, base_dataset, vocab_size):
+                    self.base_dataset = base_dataset
+                    self.vocab_size = vocab_size
+                
+                def __len__(self):
+                    return len(self.base_dataset)
+                
+                def __getitem__(self, idx):
+                    item = self.base_dataset[idx]
+                    
+                    # Validate and clamp token IDs
+                    if 'input_ids' in item:
+                        input_ids = item['input_ids']
+                        if isinstance(input_ids, torch.Tensor):
+                            item['input_ids'] = torch.clamp(input_ids, 0, self.vocab_size - 1)
+                        
+                    if 'labels' in item:
+                        labels = item['labels']
+                        if isinstance(labels, torch.Tensor):
+                            item['labels'] = torch.clamp(labels, 0, self.vocab_size - 1)
+                    
+                    return item
+            
+            validated_dataset = ValidatedDataset(dataset, vocab_size)
+            return validated_dataset, tokenizer
+        
+        # Original programming dataset implementation (fallback)
+        logger.info("="*70)
         try:
             from ..datasets.advanced_programming_datasets import ProgrammingDatasetFactory
             
@@ -3196,9 +3654,9 @@ def create_llm_config(tokenizer_type: str = "gpt4"):
         spike_threshold=1.0,
         beta=0.95,
         batch_size=8,
-        learning_rate=1e-4,
+        learning_rate=5e-5,  # CRITICAL FIX: Reduced from 1e-4 for spiking networks
         weight_decay=0.01,
-        gradient_clip=1.0,
+        gradient_clip=0.5,  # CRITICAL FIX: Tighter clipping from 1.0,
         mixed_precision=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
         seed=42,
