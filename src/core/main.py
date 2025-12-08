@@ -2146,11 +2146,13 @@ class LiquidSpikingTrainer:
                                 f"⚠️  Infinite gradient at batch {batch_idx}! "
                                 f"Skipping batch and resetting scaler."
                             )
-                            self.optimizer.zero_grad()
-                            # Force scaler to reduce scale significantly
-                            self.scaler._scale = max(
-                                self.scaler._scale * 0.1, 1.0
-                            )
+                            self.optimizer.zero_grad(set_to_none=True)
+                            # CRITICAL FIX: Must call scaler.update() to reset
+                            # the scaler state before continuing. Without this,
+                            # the next batch's unscale_() call will fail with
+                            # "unscale_() has already been called on this 
+                            # optimizer since the last update()"
+                            self.scaler.update()
                             accumulated_loss = 0
                             continue
                         
@@ -2171,7 +2173,7 @@ class LiquidSpikingTrainer:
                     # Optimizer step
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     
                     # Update EMA
                     self._update_ema()
