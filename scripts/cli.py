@@ -646,8 +646,13 @@ class LiquidSpikingCLI:
                     device=device
                 )
                 
+                # Display prompt and generated text separately
                 self.console.print("[green]" + "="*70 + "[/green]")
-                rprint(Panel(generated_text, title="✨ Generated Text", border_style="green"))
+                self.console.print(f"[bold cyan]📝 Prompt:[/bold cyan] {args.prompt}")
+                self.console.print("[green]" + "-"*70 + "[/green]")
+                rprint(Panel(generated_text, title="✨ Generated Text (New Tokens Only)", border_style="green"))
+                self.console.print("[green]" + "-"*70 + "[/green]")
+                self.console.print(f"[bold cyan]📄 Full Output:[/bold cyan] {args.prompt}{generated_text}")
                 self.console.print("[green]" + "="*70 + "[/green]")
                 
             except Exception as e:
@@ -758,9 +763,12 @@ class LiquidSpikingCLI:
         
         self.console.print(f"  ✅ Generated {generated.shape[1] - len(input_ids)} new tokens")
         
-        # Decode and return
+        # Decode only the NEW tokens (exclude prompt)
         generated_ids = generated[0].tolist()
-        generated_text = decode_fn(generated_ids)
+        new_token_ids = generated_ids[len(input_ids):]  # Only new tokens
+        
+        # Return only the newly generated text (without prompt)
+        generated_text = decode_fn(new_token_ids)
         
         return generated_text
             

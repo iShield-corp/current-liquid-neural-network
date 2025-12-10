@@ -331,17 +331,26 @@ class CrossModalAttention(nn.Module):
     """
     Cross-attention between Liquid and Mamba representations.
     Allows each pathway to query information from the other.
+    
+    RESEARCH-BASED ENHANCEMENTS (2024):
+    - Option for separate cross-attention layers per modality (BLIPv2 pattern)
+    - Learned projection dimensions for better dimension matching
+    - Support for gated residual connections
     """
     
     def __init__(
         self,
         liquid_dim: int,
         mamba_dim: int,
-        num_heads: int = 8
+        num_heads: int = 8,
+        use_separate_layers: bool = True,  # NEW: BLIPv2-style separate layers
+        use_gated_residual: bool = True    # NEW: Gated residual connections
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = min(liquid_dim, mamba_dim) // num_heads
+        self.use_separate_layers = use_separate_layers
+        self.use_gated_residual = use_gated_residual
         
         # Liquid queries Mamba
         self.liquid_q = nn.Linear(
@@ -366,6 +375,36 @@ class CrossModalAttention(nn.Module):
         self.mamba_out = nn.Linear(
             num_heads * self.head_dim, mamba_dim
         )
+        
+        # NEW: Separate attention layers for each modality (BLIPv2 pattern)
+        if use_separate_layers:
+            # Additional self-attention for refinement after cross-attention
+            self.liquid_self_attn = nn.MultiheadAttention(
+                embed_dim=liquid_dim,
+                num_heads=num_heads,
+                dropout=0.1,
+                batch_first=True
+            )
+            self.mamba_self_attn = nn.MultiheadAttention(
+                embed_dim=mamba_dim,
+                num_heads=num_heads,
+                dropout=0.1,
+                batch_first=True
+            )
+            # Layer norms for separate layers
+            self.liquid_norm = nn.LayerNorm(liquid_dim)
+            self.mamba_norm = nn.LayerNorm(mamba_dim)
+        
+        # NEW: Gated residual connections
+        if use_gated_residual:
+            self.liquid_gate = nn.Sequential(
+                nn.Linear(liquid_dim * 2, liquid_dim),
+                nn.Sigmoid()
+            )
+            self.mamba_gate = nn.Sequential(
+                nn.Linear(mamba_dim * 2, mamba_dim),
+                nn.Sigmoid()
+            )
         
     def forward(
         self,
@@ -392,7 +431,7 @@ class CrossModalAttention(nn.Module):
         k_m, v_m = kv_m.chunk(2, dim=-1)
         
         attn_l = self._compute_attention(q_l, k_m, v_m)
-        enhanced_liquid = liquid_repr + self.liquid_out(
+        cross_liquid = self.liquid_out(
             attn_l.view(batch_size, time_steps, -1)
         )
         
@@ -406,9 +445,42 @@ class CrossModalAttention(nn.Module):
         k_l, v_l = kv_l.chunk(2, dim=-1)
         
         attn_m = self._compute_attention(q_m, k_l, v_l)
-        enhanced_mamba = mamba_repr + self.mamba_out(
+        cross_mamba = self.mamba_out(
             attn_m.view(batch_size, time_steps, -1)
         )
+        
+        # Apply gated residual connections
+        if self.use_gated_residual:
+            # Gate for liquid: decides how much cross-attention to use
+            liquid_concat = torch.cat([liquid_repr, cross_liquid], dim=-1)
+            liquid_gate_weight = self.liquid_gate(liquid_concat)
+            enhanced_liquid = liquid_repr + liquid_gate_weight * cross_liquid
+            
+            # Gate for mamba: decides how much cross-attention to use  
+            mamba_concat = torch.cat([mamba_repr, cross_mamba], dim=-1)
+            mamba_gate_weight = self.mamba_gate(mamba_concat)
+            enhanced_mamba = mamba_repr + mamba_gate_weight * cross_mamba
+        else:
+            enhanced_liquid = liquid_repr + cross_liquid
+            enhanced_mamba = mamba_repr + cross_mamba
+        
+        # NEW: Apply separate self-attention layers (BLIPv2 pattern)
+        if self.use_separate_layers:
+            # Refine liquid with self-attention
+            liquid_residual = enhanced_liquid
+            enhanced_liquid = self.liquid_norm(enhanced_liquid)
+            enhanced_liquid, _ = self.liquid_self_attn(
+                enhanced_liquid, enhanced_liquid, enhanced_liquid
+            )
+            enhanced_liquid = liquid_residual + enhanced_liquid
+            
+            # Refine mamba with self-attention
+            mamba_residual = enhanced_mamba
+            enhanced_mamba = self.mamba_norm(enhanced_mamba)
+            enhanced_mamba, _ = self.mamba_self_attn(
+                enhanced_mamba, enhanced_mamba, enhanced_mamba
+            )
+            enhanced_mamba = mamba_residual + enhanced_mamba
         
         return enhanced_liquid, enhanced_mamba
     

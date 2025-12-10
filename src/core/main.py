@@ -553,14 +553,14 @@ class ModelConfig:
     stdp_layers_to_enhance: Optional[List[str]] = None  # None = all
     compute_importance_interval: int = 1  # How often to compute Fisher information (epochs)
     
-    # === Mamba Integration Configuration (NEW) ===
+    # === Mamba Integration Configuration (RESEARCH-BASED DEFAULTS 2024-2025) ===
     use_mamba: bool = False  # Enable Mamba blocks
     integration_mode: str = 'bidirectional'  # 'sequential', 'parallel', 'bidirectional'
     
-    # Mamba-specific parameters
-    mamba_d_state: int = 16  # State space dimension
-    mamba_d_conv: int = 4    # Convolution kernel size
-    mamba_expand: int = 2    # Expansion factor
+    # Mamba-specific parameters - RESEARCH-BASED: Higher d_state for better context
+    mamba_d_state: int = 64  # UPGRADED from 16 to 64 per Mamba official recommendations
+    mamba_d_conv: int = 4    # Convolution kernel size (standard)
+    mamba_expand: int = 2    # Expansion factor (standard)
     
     # Communication parameters
     spike_to_mamba_method: str = 'temporal'  # 'rate', 'temporal', 'potential'
@@ -573,6 +573,10 @@ class ModelConfig:
     # Cross-attention parameters (for bidirectional mode)
     use_cross_attention: bool = False  # Only for bidirectional
     cross_attn_heads: int = 8
+    
+    # NEW: Research-based cross-attention enhancements
+    use_separate_cross_attn_layers: bool = True   # BLIPv2-style separate layers
+    use_gated_cross_attn_residual: bool = True    # Gated residual connections
     
     def __post_init__(self):
         """Set default values for optional parameters."""
@@ -1304,6 +1308,21 @@ class LiquidSpikingNetwork(nn.Module):
             for i in range(config.num_layers)
         ])
         
+        # RESEARCH-BASED: Long-range skip connections for 8-layer architecture
+        # Based on DenseNet and ResNet-D patterns for better gradient flow
+        # Creates shortcuts: layer 0 → layer 4, layer 4 → output
+        self.use_long_range_skip = config.num_layers >= 6
+        if self.use_long_range_skip:
+            # Skip connection from early layers to mid layers
+            self.long_skip_mid = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
+            # Skip connection from mid layers to output
+            self.long_skip_out = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
+            # Layer norm for skip connections
+            self.skip_norm = nn.LayerNorm(config.hidden_dim)
+            # Learnable skip weights
+            self.skip_alpha = nn.Parameter(torch.tensor(0.1))
+            logger.info(f"📡 Long-range skip connections enabled for {config.num_layers}-layer architecture")
+        
         # Add spike decoder for probability conversion
         self.spike_decoder = SpikeDecoder(
             input_dim=config.spiking_units,
@@ -1563,8 +1582,16 @@ class LiquidSpikingNetwork(nn.Module):
         
         hidden_states = [None] * self.config.num_layers
         
+        # RESEARCH-BASED: Store early activation for long-range skip
+        early_activation = None
+        mid_activation = None
+        
         # Process through hybrid liquid-spiking blocks with proper residual handling
         for i, (block, norm) in enumerate(zip(self.hybrid_blocks, self.layer_norms)):
+            # RESEARCH-BASED: Capture early activation for long-range skip (at layer 0)
+            if hasattr(self, 'use_long_range_skip') and self.use_long_range_skip and i == 0:
+                early_activation = x.clone()
+            
             if self.use_gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory (trades compute for memory)
                 def create_custom_forward(module):
@@ -1650,6 +1677,15 @@ class LiquidSpikingNetwork(nn.Module):
             x = norm(x)
             x = self.dropout(x)
             
+            # RESEARCH-BASED: Apply long-range skip connection at mid-point
+            if hasattr(self, 'use_long_range_skip') and self.use_long_range_skip:
+                mid_layer = self.config.num_layers // 2
+                if i == mid_layer and early_activation is not None:
+                    # Long-range skip from layer 0 to mid layer
+                    skip_contrib = self.long_skip_mid(early_activation)
+                    x = x + self.skip_alpha * self.skip_norm(skip_contrib)
+                    mid_activation = x.clone()  # Store for output skip
+            
             # Apply attention
             if i % 2 == 1 and i // 2 < len(self.attention_layers):
                 if self.task_type == TaskType.LLM:
@@ -1657,6 +1693,11 @@ class LiquidSpikingNetwork(nn.Module):
                 else:
                     attn_input = x.unsqueeze(1) if x.dim() == 2 else x
                     x = x + self.attention_layers[i // 2](attn_input).squeeze(1)
+        
+        # RESEARCH-BASED: Final long-range skip connection
+        if hasattr(self, 'use_long_range_skip') and self.use_long_range_skip and mid_activation is not None:
+            skip_out = self.long_skip_out(mid_activation)
+            x = x + self.skip_alpha * self.skip_norm(skip_out)
         
         output = self.output_head(x)
         return output

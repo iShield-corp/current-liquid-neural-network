@@ -93,10 +93,11 @@ class IntegratedMambaLiquidSpikingBlock(nn.Module):
                 config.spiking_units, config.liquid_units, batch_first=True
             )
         
-        # 3. Mamba Block
+        # 3. Mamba Block - RESEARCH-BASED: Use higher d_state (64-128) for better context
+        # Per Mamba official repo and ICLR 2025 findings
         mamba_config = MambaConfig(
             d_model=config.hidden_dim,
-            d_state=getattr(config, 'mamba_d_state', 16),
+            d_state=getattr(config, 'mamba_d_state', 64),  # Upgraded from 16 to 64
             d_conv=getattr(config, 'mamba_d_conv', 4),
             expand_factor=getattr(config, 'mamba_expand', 2)
         )
@@ -137,7 +138,7 @@ class IntegratedMambaLiquidSpikingBlock(nn.Module):
         elif integration_mode == 'bidirectional':
             self.bidirectional_exchange = BidirectionalStateExchange(
                 liquid_units=config.liquid_units,
-                mamba_d_state=getattr(config, 'mamba_d_state', 16),
+                mamba_d_state=getattr(config, 'mamba_d_state', 64),  # Upgraded default
                 mamba_d_model=config.hidden_dim
             )
             self.cross_attention = CrossModalAttention(
@@ -145,6 +146,9 @@ class IntegratedMambaLiquidSpikingBlock(nn.Module):
                 mamba_dim=config.hidden_dim,
                 num_heads=8
             )
+            # RESEARCH-BASED: Learnable fusion weight instead of fixed 0.5
+            # Per multimodal cross-attention best practices
+            self.fusion_alpha = nn.Parameter(torch.tensor(0.5))
         
         # Normalization
         self.norm1 = nn.LayerNorm(config.hidden_dim)
@@ -238,12 +242,22 @@ class IntegratedMambaLiquidSpikingBlock(nn.Module):
             output = self.norm2(output + residual)
             
         elif self.integration_mode == 'bidirectional':
-            # Spike → Liquid ↔ Mamba (full bidirectional exchange)
-            
-            # Initial Mamba processing
+            # TRUE bidirectional: Process in both directions
             spike_repr = self.spike_to_mamba(spike_train)
-            mamba_input = self.norm1(spike_repr)
-            mamba_output = self.mamba(mamba_input)
+            
+            # Forward Mamba pass
+            mamba_input_fwd = self.norm1(spike_repr)
+            mamba_output_fwd = self.mamba(mamba_input_fwd)
+            
+            # Backward Mamba pass (flip, process, flip back)
+            mamba_input_bwd = torch.flip(mamba_input_fwd, dims=[1])
+            mamba_output_bwd = self.mamba(mamba_input_bwd)
+            mamba_output_bwd = torch.flip(mamba_output_bwd, dims=[1])
+            
+            # RESEARCH-BASED: Learnable bidirectional fusion instead of fixed averaging
+            # Use sigmoid to keep weight between 0-1
+            bidi_weight = torch.sigmoid(self.fusion_alpha) if hasattr(self, 'fusion_alpha') else 0.5
+            mamba_output = bidi_weight * mamba_output_fwd + (1 - bidi_weight) * mamba_output_bwd
             
             # Cross-modal attention (Liquid and Mamba attend to each)
             liquid_enhanced, mamba_enhanced = self.cross_attention(
@@ -253,8 +267,8 @@ class IntegratedMambaLiquidSpikingBlock(nn.Module):
             # Project enhanced liquid back to hidden dimension
             liquid_final = self.liquid_to_hidden(liquid_enhanced)
             
-            # Combine with learned weighting
-            alpha = 0.5  # Could be learned
+            # RESEARCH-BASED: Learnable modality fusion weight
+            alpha = torch.sigmoid(self.fusion_alpha) if hasattr(self, 'fusion_alpha') else 0.5
             output = alpha * liquid_final + (1 - alpha) * mamba_enhanced
             output = self.norm2(output + residual)
         
