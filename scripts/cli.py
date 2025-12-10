@@ -605,21 +605,164 @@ class LiquidSpikingCLI:
         self.logger.header("Inference")
         self.logger.info(f"📂 Loading model from {args.model_path}")
         
-        task_type = TaskType.LLM if 'llm' in args.model_path.lower() else TaskType.VISION
-        if 'robotics' in args.model_path.lower(): task_type = TaskType.ROBOTICS
+        # Detect task type from path or default to LLM
+        task_type = TaskType.LLM
+        if 'vision' in args.model_path.lower():
+            task_type = TaskType.VISION
+        elif 'robotics' in args.model_path.lower():
+            task_type = TaskType.ROBOTICS
         
         model, config = load_model(args.model_path, task_type)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
+        model.eval()
         
         if task_type == TaskType.LLM and args.prompt:
             self.logger.info(f"📝 Prompt: {args.prompt}")
+            self.logger.info(f"🔧 Settings: max_length={args.max_length}, temperature={args.temperature}")
+            self.console.print("\n[yellow]🤖 Generating...[/yellow]\n")
+            
+            # Detect tokenizer type from config
+            tokenizer_type = getattr(config, 'tokenizer_type', None)
+            vocab_size = getattr(config, 'vocab_size', 50257)
+            
+            # Determine tokenizer based on vocab size if not specified
+            if tokenizer_type is None:
+                if vocab_size >= 200000:
+                    tokenizer_type = 'o200k'
+                elif vocab_size >= 100000:
+                    tokenizer_type = 'gpt4'
+                else:
+                    tokenizer_type = 'gpt2'
+            
+            self.logger.info(f"🔤 Using tokenizer: {tokenizer_type} (vocab: {vocab_size:,})")
+            
+            try:
+                generated_text = self._generate_text_with_model(
+                    model, config, args.prompt, 
+                    max_length=args.max_length,
+                    temperature=args.temperature,
+                    tokenizer_type=tokenizer_type,
+                    device=device
+                )
+                
+                self.console.print("[green]" + "="*70 + "[/green]")
+                rprint(Panel(generated_text, title="✨ Generated Text", border_style="green"))
+                self.console.print("[green]" + "="*70 + "[/green]")
+                
+            except Exception as e:
+                self.logger.error(f"Generation failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        elif args.input_file:
+            # Handle vision/robotics inference
+            import numpy as np
+            self.logger.info(f"📁 Loading input from {args.input_file}")
+            input_data = np.load(args.input_file)
+            input_tensor = torch.tensor(input_data, dtype=torch.float32, device=device)
+            if input_tensor.dim() == 2:
+                input_tensor = input_tensor.unsqueeze(0)
+            
+            with torch.no_grad():
+                output = model(input_tensor)
+            
+            self.logger.success(f"Output shape: {output.shape}")
+            self.console.print(f"[cyan]Output:[/cyan] {output}")
+        
+        else:
+            self.logger.warning("⚠️ No prompt or input file provided")
+            self.console.print("Usage:")
+            self.console.print("  --prompt 'Your text here' for LLM generation")
+            self.console.print("  --input-file data.npy for vision/robotics inference")
+    
+    def _generate_text_with_model(self, model, config, prompt, max_length=100, 
+                                   temperature=0.8, tokenizer_type='o200k', device='cuda'):
+        """Generate text using the model with proper tokenizer handling."""
+        import torch.nn.functional as F
+        
+        # Load tokenizer based on type
+        if tokenizer_type in ['o200k', 'gpt4', 'gpt3']:
+            import tiktoken
+            encoding_map = {
+                'o200k': 'o200k_base',
+                'gpt4': 'cl100k_base',
+                'gpt3': 'p50k_base'
+            }
+            encoding = tiktoken.get_encoding(encoding_map.get(tokenizer_type, 'o200k_base'))
+            
+            # Encode prompt
+            input_ids = encoding.encode(prompt, allowed_special='all')
+            eos_token_id = encoding.eot_token
+            
+            def decode_fn(ids):
+                return encoding.decode(ids)
+        else:
+            # Use transformers tokenizer
             from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained("gpt2") # Default fallback
+            tokenizer = AutoTokenizer.from_pretrained('gpt2')
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
             
-            text = generate_text(model, config, tokenizer, args.prompt, args.max_length, args.temperature)
+            input_ids = tokenizer.encode(prompt)
+            eos_token_id = tokenizer.eos_token_id
             
-            rprint(Panel(text, title="✨ Generated Text", border_style="green"))
+            def decode_fn(ids):
+                return tokenizer.decode(ids, skip_special_tokens=True)
+        
+        # Convert to tensor
+        generated = torch.tensor([input_ids], dtype=torch.long, device=device)
+        
+        # Generation loop
+        model.eval()
+        with torch.no_grad():
+            for step in range(max_length):
+                # Get model output
+                outputs = model(generated)
+                
+                # Handle different output formats
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                
+                # Get logits for last position
+                if logits.dim() == 3:
+                    next_token_logits = logits[:, -1, :]
+                elif logits.dim() == 2:
+                    next_token_logits = logits
+                else:
+                    next_token_logits = logits.view(1, -1)
+                
+                # Apply temperature
+                if temperature > 0:
+                    next_token_logits = next_token_logits / temperature
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    
+                    # Sample from distribution
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    # Greedy sampling
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                
+                # Append to sequence
+                generated = torch.cat([generated, next_token], dim=1)
+                
+                # Check for EOS
+                if eos_token_id is not None and next_token.item() == eos_token_id:
+                    break
+                
+                # Progress indicator every 10 tokens
+                if (step + 1) % 10 == 0:
+                    self.console.print(f"  Generated {step + 1}/{max_length} tokens...", end='\r')
+        
+        self.console.print(f"  ✅ Generated {generated.shape[1] - len(input_ids)} new tokens")
+        
+        # Decode and return
+        generated_ids = generated[0].tolist()
+        generated_text = decode_fn(generated_ids)
+        
+        return generated_text
             
     def _handle_benchmark(self, args):
         self.logger.header("Benchmark")
