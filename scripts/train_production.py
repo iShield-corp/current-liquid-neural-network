@@ -265,21 +265,21 @@ def setup_model_config(args) -> ModelConfig:
     learning_rate = args.learning_rate if args.learning_rate else preset['learning_rate']
     gradient_clip = args.gradient_clip if args.gradient_clip else preset['gradient_clip']
     
-    # Create config using the factory function
-    config = create_llm_config(
-        vocab_size=args.vocab_size,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        sequence_length=args.seq_length,
-        batch_size=args.batch_size,
-        learning_rate=learning_rate,
-        num_epochs=args.epochs,
-        gradient_clip=gradient_clip,
-        device=args.device,
-        mixed_precision=args.mixed_precision
-    )
+    # Create base config using the factory function
+    config = create_llm_config(tokenizer_type=args.tokenizer)
     
-    # Update with specific overrides
+    # Override with preset and CLI arguments
+    config.vocab_size = args.vocab_size
+    config.output_dim = args.vocab_size
+    config.hidden_dim = hidden_dim
+    config.num_layers = num_layers
+    config.sequence_length = args.seq_length
+    config.batch_size = args.batch_size
+    config.learning_rate = learning_rate
+    config.num_epochs = args.epochs
+    config.gradient_clip = gradient_clip
+    config.device = args.device
+    config.mixed_precision = args.mixed_precision
     config.liquid_units = liquid_units
     config.spiking_units = spiking_units
     config.weight_decay = 0.01
