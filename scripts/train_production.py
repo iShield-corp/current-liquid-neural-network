@@ -389,7 +389,7 @@ def load_dataset(args, tokenizer, split='train'):
         
         for name in dataset_names:
             if name == 'wikitext2':
-                ds = WikiTextDataset(
+                ds = WikiTextDataset.create_dataset(
                     version='wikitext-2-v1',
                     split=split,
                     tokenizer=tokenizer,
@@ -398,7 +398,7 @@ def load_dataset(args, tokenizer, split='train'):
                 datasets.append(ds)
                 logger.info(f"  ✅ Added wikitext2 ({len(ds)} samples)")
             elif name == 'wikitext103':
-                ds = WikiTextDataset(
+                ds = WikiTextDataset.create_dataset(
                     version='wikitext-103-v1',
                     split=split,
                     tokenizer=tokenizer,
@@ -422,14 +422,14 @@ def load_dataset(args, tokenizer, split='train'):
         return combined
         
     elif args.dataset == 'wikitext2':
-        return WikiTextDataset(
+        return WikiTextDataset.create_dataset(
             version='wikitext-2-v1',
             split=split,
             tokenizer=tokenizer,
             max_length=args.seq_length
         )
     elif args.dataset == 'wikitext103':
-        return WikiTextDataset(
+        return WikiTextDataset.create_dataset(
             version='wikitext-103-v1',
             split=split,
             tokenizer=tokenizer,
