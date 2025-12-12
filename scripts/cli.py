@@ -291,6 +291,30 @@ class LiquidSpikingCLI:
         gpu_group.add_argument('--gpu-strategy', choices=['auto', 'dp', 'ddp', 'none'], 
                               default='auto',
                               help='Multi-GPU strategy')
+        
+        # Continual Learning options
+        continual_group = train_parser.add_argument_group('Continual Learning', 
+                                                          'Advanced memory features for post-training learning')
+        continual_group.add_argument('--use-continual-learning', action='store_true',
+                                    help='Enable continual learning system (all 6 features)')
+        continual_group.add_argument('--episodic-memory-size', type=int, default=10000,
+                                    help='Episodic memory bank size (default: 10000)')
+        continual_group.add_argument('--memory-key-dim', type=int, default=256,
+                                    help='Memory key dimension (default: 256)')
+        continual_group.add_argument('--ewc-lambda', type=float, default=5000.0,
+                                    help='EWC regularization strength (default: 5000.0)')
+        continual_group.add_argument('--si-c', type=float, default=0.1,
+                                    help='Synaptic Intelligence coefficient (default: 0.1)')
+        continual_group.add_argument('--consolidation-frequency', type=int, default=1000,
+                                    help='Memory consolidation frequency in steps (default: 1000)')
+        continual_group.add_argument('--replay-frequency', type=float, default=0.3,
+                                    help='Experience replay frequency 0-1 (default: 0.3)')
+        continual_group.add_argument('--replay-batch-size', type=int, default=16,
+                                    help='Replay batch size (default: 16)')
+        continual_group.add_argument('--replay-buffer-size', type=int, default=5000,
+                                    help='Experience replay buffer size (default: 5000)')
+        continual_group.add_argument('--enable-progressive-networks', action='store_true',
+                                    help='Enable progressive network expansion (optional feature)')
 
     def _add_inference_parser(self, subparsers):
         parser = subparsers.add_parser('inference', help='💡 Run inference')
@@ -367,6 +391,22 @@ class LiquidSpikingCLI:
         if args.mamba_d_state: config.mamba_d_state = args.mamba_d_state
         if args.use_cross_attention: config.use_cross_attention = True
         if args.use_adaptive_gating: config.use_adaptive_gating = True
+        
+        # Apply continual learning settings
+        if getattr(args, 'use_continual_learning', False):
+            config.use_continual_learning = True
+            if args.episodic_memory_size: config.episodic_memory_size = args.episodic_memory_size
+            if args.memory_key_dim: config.memory_key_dim = args.memory_key_dim
+            if args.ewc_lambda: config.ewc_lambda = args.ewc_lambda
+            if args.si_c: config.si_c = args.si_c
+            if args.consolidation_frequency: 
+                config.consolidation_frequency = args.consolidation_frequency
+                config.consolidation_interval = args.consolidation_frequency
+            if args.replay_frequency: config.replay_frequency = args.replay_frequency
+            if args.replay_batch_size: config.replay_batch_size = args.replay_batch_size
+            if hasattr(args, 'replay_buffer_size') and args.replay_buffer_size:
+                config.replay_buffer_size = args.replay_buffer_size
+            if args.enable_progressive_networks: config.enable_progressive_networks = True
         
         # Create model
         self.logger.info("🧠 Initializing model...")
