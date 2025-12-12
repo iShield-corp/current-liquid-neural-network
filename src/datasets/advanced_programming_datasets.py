@@ -28,16 +28,22 @@ import random
 import time
 import json
 import hashlib
-from typing import List, Dict, Tuple, Optional, Union, Set
+from typing import List, Dict, Tuple, Optional, Union, Set, TYPE_CHECKING
 from dataclasses import dataclass
 from collections import defaultdict
 import torch
 from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset, Dataset as HFDataset, concatenate_datasets
+# Note: HuggingFace datasets imported locally to avoid circular import with local datasets folder
 from transformers import AutoTokenizer, PreTrainedTokenizer
 import numpy as np
 from tqdm import tqdm
 import logging
+
+# Use TYPE_CHECKING to avoid circular import while keeping type hints
+if TYPE_CHECKING:
+    from datasets import Dataset as HFDataset
+else:
+    HFDataset = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -122,6 +128,16 @@ class AdvancedProgrammingDataset(Dataset):
     - Reasoning-focused code snippets
     """
     
+    @staticmethod
+    def _get_hf_datasets():
+        """Import HuggingFace datasets dynamically to avoid circular import."""
+        try:
+            from datasets import load_dataset, Dataset as HFD, concatenate_datasets
+            return load_dataset, HFD, concatenate_datasets
+        except ImportError:
+            logger.error("HuggingFace datasets not installed. Install with: pip install datasets")
+            return None, None, None
+    
     def __init__(
         self,
         config: ProgrammingDatasetConfig,
@@ -150,7 +166,7 @@ class AdvancedProgrammingDataset(Dataset):
         self.dataset = self._load_and_combine_datasets()
         logger.info(f"Final dataset size: {len(self.dataset):,} samples")
         
-    def _load_and_combine_datasets(self) -> HFDataset:
+    def _load_and_combine_datasets(self) -> 'HFDataset':
         """Load and combine multiple programming datasets."""
         logger.info("Loading multiple programming datasets...")
         
@@ -244,7 +260,7 @@ class AdvancedProgrammingDataset(Dataset):
         
         return combined
     
-    def _load_the_stack(self) -> Optional[HFDataset]:
+    def _load_the_stack(self) -> Optional["HFDataset"]:
         """Load Rosetta Code dataset as primary source."""
         try:
             logger.info("Loading Rosetta Code dataset...")
@@ -291,7 +307,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning(f"Failed to load Rosetta Code dataset: {str(e)}")
             return None
 
-    def _load_github_code(self) -> Optional[HFDataset]:
+    def _load_github_code(self) -> Optional["HFDataset"]:
         """Load Source Code dataset as GitHub code replacement."""
         try:
             logger.info("Loading Source Code dataset...")
@@ -344,7 +360,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning(f"Failed to load Source Code dataset: {str(e)}")
             return None
     
-    def _load_code_search_net(self) -> Optional[HFDataset]:
+    def _load_code_search_net(self) -> Optional["HFDataset"]:
         """Load CodeAlpaca dataset as CodeSearchNet replacement."""
         try:
             logger.info("Loading CodeAlpaca dataset...")
@@ -397,7 +413,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning(f"Failed to load CodeAlpaca dataset: {str(e)}")
             return None
     
-    def _load_apps(self) -> Optional[HFDataset]:
+    def _load_apps(self) -> Optional["HFDataset"]:
         """Create synthetic programming competition problems as APPS replacement."""
         try:
             logger.info("Creating synthetic programming competition dataset...")
@@ -450,7 +466,7 @@ class AdvancedProgrammingDataset(Dataset):
                         "difficulty": "medium"
                     })
             
-            data = HFDataset.from_list(competition_problems)
+            _, HFD, _ = self._get_hf_datasets(); data = HFD.from_list(competition_problems)
             
             # Apply quality filtering
             data = self._apply_quality_filtering(data)
@@ -502,7 +518,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning(f"Failed to load APPS dataset: {e}")
             return None
     
-    def _load_tiny_codes(self) -> Optional[HFDataset]:
+    def _load_tiny_codes(self) -> Optional["HFDataset"]:
         """Create synthetic reasoning-focused code snippets as Tiny Codes replacement."""
         try:
             logger.info("Creating synthetic reasoning code dataset...")
@@ -557,7 +573,7 @@ class AdvancedProgrammingDataset(Dataset):
                         "problem_type": "reasoning"
                     })
             
-            data = HFDataset.from_list(reasoning_examples)
+            _, HFD, _ = self._get_hf_datasets(); data = HFD.from_list(reasoning_examples)
             
             # Apply quality filtering
             data = self._apply_quality_filtering(data)
@@ -569,7 +585,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning(f"Failed to create synthetic reasoning dataset: {str(e)}")
             return None
     
-    def _load_wikipedia(self) -> Optional[HFDataset]:
+    def _load_wikipedia(self) -> Optional["HFDataset"]:
         """Load Wikipedia dataset for general knowledge and factual information."""
         try:
             logger.info("Loading simplified Wikipedia dataset...")
@@ -614,7 +630,7 @@ class AdvancedProgrammingDataset(Dataset):
                         })
                 
                 if knowledge_samples:
-                    data = HFDataset.from_list(knowledge_samples)
+                    _, HFD, _ = self._get_hf_datasets(); data = HFD.from_list(knowledge_samples)
                     logger.info(f"Successfully created {len(data):,} general knowledge articles")
                     return data
                 else:
@@ -652,7 +668,7 @@ class AdvancedProgrammingDataset(Dataset):
                         logger.info(f"Processed {sample_count:,} Wikipedia articles")
             
             if samples:
-                data = HFDataset.from_list(samples)
+                _, HFD, _ = self._get_hf_datasets(); data = HFD.from_list(samples)
                 logger.info(f"Successfully loaded {len(data):,} Wikipedia articles")
                 return data
             else:
@@ -663,7 +679,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning(f"Failed to load Wikipedia dataset: {str(e)}")
             return None
     
-    def _load_openorca(self) -> Optional[HFDataset]:
+    def _load_openorca(self) -> Optional["HFDataset"]:
         """Load OpenOrca dataset for conversation and instruction following."""
         try:
             logger.info("Loading OpenOrca dataset from Open-Orca/OpenOrca...")
@@ -708,7 +724,7 @@ class AdvancedProgrammingDataset(Dataset):
                         logger.info(f"Processed {sample_count:,} OpenOrca conversations")
             
             if samples:
-                data = HFDataset.from_list(samples)
+                _, HFD, _ = self._get_hf_datasets(); data = HFD.from_list(samples)
                 logger.info(f"Successfully loaded {len(data):,} OpenOrca conversations")
                 return data
             else:
@@ -719,7 +735,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning(f"Failed to load OpenOrca dataset: {str(e)}")
             return None
     
-    def _apply_quality_filtering(self, data: HFDataset) -> HFDataset:
+    def _apply_quality_filtering(self, data: HFDataset) -> "HFDataset":
         """Apply quality filtering to dataset."""
         original_size = len(data)
         
@@ -767,7 +783,7 @@ class AdvancedProgrammingDataset(Dataset):
         
         return filtered_data
     
-    def _apply_final_filtering(self, data: HFDataset) -> HFDataset:
+    def _apply_final_filtering(self, data: HFDataset) -> "HFDataset":
         """Apply final filtering and balancing."""
         # Language balancing based on weights
         language_counts = defaultdict(int)
@@ -811,7 +827,7 @@ class AdvancedProgrammingDataset(Dataset):
             logger.warning("No samples survived language balancing")
             return data
     
-    def _create_fallback_dataset(self) -> HFDataset:
+    def _create_fallback_dataset(self) -> "HFDataset":
         """Create fallback dataset if main datasets fail to load."""
         logger.info("Creating fallback programming dataset...")
         
@@ -1109,7 +1125,7 @@ int main() {
         while len(all_examples) < 1000:
             all_examples.extend(all_examples[:min(100, 1000 - len(all_examples))])
         
-        return HFDataset.from_list(all_examples)
+        _, HFD, _ = self._get_hf_datasets(); return HFD.from_list(all_examples)
     
     def __len__(self) -> int:
         return len(self.dataset)

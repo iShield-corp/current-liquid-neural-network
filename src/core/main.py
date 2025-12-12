@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Text processing imports
 from transformers import AutoTokenizer, PreTrainedTokenizer
-from datasets import load_dataset, Dataset as HFDataset
+# Note: load_dataset imported locally in functions to avoid circular import
 import requests
 import gzip
 import urllib.request
@@ -548,6 +548,20 @@ class ModelConfig:
     use_experience_replay: bool = True
     replay_buffer_size: int = 1000
     replay_sampling_strategy: str = 'balanced'  # 'uniform', 'importance', 'balanced'
+    
+    # Advanced Continual Learning Features (NEW - Research-based 2024-2025)
+    episodic_memory_size: int = 10000  # Episodic memory bank size
+    memory_key_dim: int = 256  # Dimension for memory keys
+    memory_value_dim: int = 512  # Dimension for memory values
+    num_memory_read_heads: int = 4  # Attention heads for reading
+    ewc_lambda: float = 5000.0  # EWC regularization strength
+    ewc_online: bool = True  # Use online EWC (more efficient)
+    si_c: float = 0.1  # Synaptic Intelligence coefficient
+    consolidation_interval: int = 1000  # Steps between consolidation
+    consolidation_frequency: int = 1000  # Alias for consolidation_interval
+    replay_frequency: float = 0.3  # Fraction of batches to use replay (0.0-1.0)
+    replay_batch_size: int = 16  # Batch size for replay samples
+    enable_progressive_networks: bool = False  # Progressive capacity expansion
     
     # Integration flags - optional
     stdp_layers_to_enhance: Optional[List[str]] = None  # None = all
@@ -2042,11 +2056,39 @@ class LiquidSpikingTrainer:
             base_lr=config.learning_rate
         ).to(self.device)
         
-        # Continual Learning Integration (NEW)
+        # Advanced Continual Learning Integration (FULL SYSTEM)
         self.continual_system = None
-        self.replay_buffer = None
+        self.continual_memory_system = None
         
         if config.use_continual_learning:
+            # Import the advanced continual learning system
+            from .continual_memory import (
+                ContinualLearningSystem,
+                ContinualMemoryConfig
+            )
+            
+            # Create configuration for continual learning
+            cl_config = ContinualMemoryConfig(
+                episodic_memory_size=config.episodic_memory_size,
+                memory_key_dim=config.memory_key_dim,
+                memory_value_dim=config.memory_value_dim,
+                num_read_heads=config.num_memory_read_heads,
+                replay_buffer_size=config.replay_buffer_size,
+                ewc_lambda=config.ewc_lambda,
+                ewc_online=config.ewc_online,
+                si_c=config.si_c,
+                consolidation_interval=config.consolidation_interval,
+                enable_progressive=config.enable_progressive_networks
+            )
+            
+            # Create full continual learning system with all 6 features
+            self.continual_memory_system = ContinualLearningSystem(
+                base_model=self.model,
+                config=cl_config,
+                enable_all=True
+            )
+            
+            # Also keep legacy system for backward compatibility
             from .plasticity import ContinualLearningSTDP, TaskBuffer
             
             self.continual_system = ContinualLearningSTDP(
@@ -2057,20 +2099,17 @@ class LiquidSpikingTrainer:
                 meta_lr=config.meta_lr
             )
             
-            if config.use_experience_replay:
-                self.replay_buffer = TaskBuffer(
-                    buffer_size=config.replay_buffer_size,
-                    sampling_strategy=config.replay_sampling_strategy
-                )
-            
             # Track task performance for continual learning
             self.task_performance = {}
             self.compute_importance_every = config.compute_importance_interval
             
-            logger.info("🧠 Continual learning enabled")
-            logger.info(f"   Consolidation strength: {config.consolidation_strength}")
-            if config.use_experience_replay:
-                logger.info(f"   Experience replay: {config.replay_buffer_size} examples")
+            logger.info("🧠 Advanced Continual Learning System Enabled")
+            logger.info(f"   ✅ Episodic Memory Bank: {config.episodic_memory_size} slots")
+            logger.info(f"   ✅ Experience Replay Buffer: {config.replay_buffer_size} examples")
+            logger.info(f"   ✅ Elastic Weight Consolidation (EWC): λ={config.ewc_lambda}")
+            logger.info(f"   ✅ Synaptic Intelligence (SI): c={config.si_c}")
+            logger.info(f"   ✅ Memory Consolidation: every {config.consolidation_interval} steps")
+            logger.info(f"   ✅ Progressive Networks: {'Enabled' if config.enable_progressive_networks else 'Disabled'}")
         
         # Add enhanced forward method to hybrid blocks
         for block in self.model.hybrid_blocks:
@@ -2154,12 +2193,14 @@ class LiquidSpikingTrainer:
                         )
                         continue
                     
-                    # Add consolidation loss for continual learning (NEW)
-                    if self.continual_system is not None:
-                        consolidation_loss = (
-                            self.continual_system
-                            .compute_consolidation_loss()
-                        )
+                    # Add consolidation loss for continual learning
+                    if self.continual_memory_system is not None:
+                        # Use the advanced continual learning system
+                        consolidation_loss = self.continual_memory_system.compute_regularization_loss()
+                        loss = task_loss + consolidation_loss
+                    elif self.continual_system is not None:
+                        # Fall back to legacy system
+                        consolidation_loss = self.continual_system.compute_consolidation_loss()
                         loss = task_loss + consolidation_loss
                     else:
                         loss = task_loss
@@ -2215,6 +2256,35 @@ class LiquidSpikingTrainer:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
+                    
+                    # Store experiences in replay buffer (NEW)
+                    if self.continual_memory_system is not None:
+                        # Store with priority based on loss
+                        priority = task_loss.item()
+                        self.continual_memory_system.store_experience(
+                            data, targets, priority=priority
+                        )
+                    
+                    # Experience replay for continual learning (NEW)
+                    if (self.continual_memory_system is not None and 
+                        len(self.continual_memory_system.replay_buffer) > 0 and
+                        np.random.random() < self.config.replay_frequency if hasattr(self.config, 'replay_frequency') else 0.3):
+                        
+                        # Sample from replay buffer
+                        replay_inputs, replay_targets = self.continual_memory_system.replay_experiences(
+                            batch_size=max(1, data.size(0) // 2)
+                        )
+                        
+                        if replay_inputs is not None:
+                            with autocast('cuda'):
+                                replay_outputs = self.model(replay_inputs)
+                                replay_loss = self._compute_loss(replay_outputs, replay_targets)
+                                replay_loss = replay_loss / self.accumulation_steps
+                            
+                            self.scaler.scale(replay_loss).backward()
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                            self.optimizer.zero_grad(set_to_none=True)
                     
                     # Update EMA
                     self._update_ema()
@@ -2844,8 +2914,27 @@ class LiquidSpikingTrainer:
         # Regular training for this task
         self.train(train_loader, val_loader, num_epochs)
         
-        # Compute parameter importance for this task
-        if self.continual_system is not None:
+        # Use advanced continual learning system if available
+        if self.continual_memory_system is not None:
+            logger.info(f"🧠 Processing Task {task_id} with advanced continual learning...")
+            
+            # Compute parameter importance (EWC Fisher Information)
+            self.continual_memory_system.on_task_complete(
+                train_loader,
+                self.criterion,
+                task_id
+            )
+            
+            # Memory statistics
+            stats = self.continual_memory_system.get_memory_stats()
+            logger.info(f"📊 Memory System Stats:")
+            logger.info(f"   Episodic memories: {stats['episodic_memory_usage']}/{stats['episodic_memory_capacity']}")
+            logger.info(f"   Replay buffer: {stats['replay_buffer_size']}/{stats['replay_buffer_capacity']}")
+            logger.info(f"   EWC tasks: {stats['ewc_tasks']}")
+            logger.info(f"   SI omega mean: {stats['si_omega_mean']:.6f}")
+            
+        # Fall back to legacy system if available
+        elif self.continual_system is not None:
             logger.info(f"🔍 Computing parameter importance for Task {task_id}...")
             self.continual_system.compute_parameter_importance(
                 train_loader, num_samples=1000
@@ -2854,10 +2943,6 @@ class LiquidSpikingTrainer:
             # Consolidate knowledge for this task
             logger.info(f"🔒 Consolidating knowledge for Task {task_id}...")
             self.continual_system.consolidate_task_knowledge()
-            
-            # Store examples for experience replay
-            if self.replay_buffer is not None:
-                self._store_task_examples(task_id, train_loader, max_examples=200)
         
         # Evaluate on validation set
         self.model.eval()
@@ -2870,19 +2955,71 @@ class LiquidSpikingTrainer:
         
         return val_accuracy
     
+    def evaluate(self, dataloader):
+        """
+        Evaluate model on a validation/test set.
+        
+        Args:
+            dataloader: DataLoader with evaluation data
+            
+        Returns:
+            accuracy: Accuracy on the dataset
+        """
+        self.model.eval()
+        correct = 0
+        total = 0
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                # Handle different batch formats
+                if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                    data, targets = batch
+                elif isinstance(batch, dict):
+                    data = batch.get('input_ids', batch.get('data'))
+                    targets = batch.get('labels', batch.get('targets', data))
+                else:
+                    data = batch
+                    targets = data
+                
+                data = data.to(self.device)
+                targets = targets.to(self.device)
+                
+                # Forward pass
+                outputs = self.model(data)
+                loss = self._compute_loss(outputs, targets)
+                total_loss += loss.item()
+                
+                # Calculate accuracy
+                if len(outputs.shape) == 3:  # Sequence output
+                    predictions = outputs.argmax(dim=-1)
+                    correct += (predictions == targets).sum().item()
+                    total += targets.numel()
+                else:  # Single output
+                    predictions = outputs.argmax(dim=-1)
+                    correct += (predictions == targets).sum().item()
+                    total += targets.size(0)
+        
+        accuracy = correct / total if total > 0 else 0.0
+        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+        
+        return accuracy
+    
     def _store_task_examples(self, task_id: int, dataloader, max_examples: int = 200):
         """
-        Store examples from this task for experience replay.
+        Store examples from this task for experience replay in continual memory system.
         
         Args:
             task_id: Task identifier
             dataloader: DataLoader for the task
             max_examples: Maximum number of examples to store
         """
-        examples = []
-        importance_scores = []
+        if self.continual_memory_system is None:
+            return
         
+        examples = []
         self.model.eval()
+        
         with torch.no_grad():
             for batch in dataloader:
                 if len(examples) >= max_examples:
@@ -2901,19 +3038,22 @@ class LiquidSpikingTrainer:
                 data = data.to(self.device)
                 targets = targets.to(self.device)
                 
-                # Get model outputs to compute importance scores
+                # Get model outputs to compute priority scores
                 outputs = self.model(data)
                 loss = self._compute_loss(outputs, targets)
                 
-                # Store examples with their importance (based on loss)
+                # Store examples with their priority (based on loss)
                 for i in range(min(data.size(0), max_examples - len(examples))):
+                    # Add to continual memory system's replay buffer
+                    self.continual_memory_system.replay_buffer.add(
+                        data[i:i+1],
+                        targets[i:i+1],
+                        task_id,
+                        loss.item()
+                    )
                     examples.append((data[i].cpu(), targets[i].cpu()))
-                    importance_scores.append(loss.item())
         
-        # Add to replay buffer
-        if self.replay_buffer is not None:
-            self.replay_buffer.add_examples(examples, task_id, importance_scores)
-            logger.info(f"📦 Stored {len(examples)} examples from Task {task_id}")
+        logger.info(f"📦 Stored {len(examples)} examples from Task {task_id} in continual memory")
     
     def evaluate_all_tasks(self, task_dataloaders: dict):
         """
@@ -3025,12 +3165,27 @@ class WikiTextDataset:
     """
     
     @staticmethod
+    def _get_hf_datasets():
+        """Import HuggingFace datasets dynamically to avoid circular import."""
+        try:
+            # Import at function level to avoid circular import
+            from datasets import load_dataset as hf_load_dataset
+            return hf_load_dataset
+        except ImportError:
+            logger.error("HuggingFace datasets not installed. Install with: pip install datasets")
+            return None
+    
+    @staticmethod
     def load_wikitext103(split='train', cache_dir='./data'):
         """Load WikiText-103 dataset (~100M tokens).
         
         This is 50x larger than WikiText-2 and RECOMMENDED for models with 100M+ parameters.
         Provides sufficient data for proper language learning.
         """
+        load_dataset = WikiTextDataset._get_hf_datasets()
+        if load_dataset is None:
+            raise ImportError("HuggingFace datasets not available")
+            
         try:
             # Try to load from HuggingFace datasets
             logger.info(f"Loading WikiText-103 ({split} split)...")
@@ -3053,6 +3208,10 @@ class WikiTextDataset:
         
         USE WikiText-103 or combined datasets instead for proper training!
         """
+        load_dataset = WikiTextDataset._get_hf_datasets()
+        if load_dataset is None:
+            return WikiTextDataset._download_wikitext2_manual(split, cache_dir)
+            
         try:
             # Try to load from HuggingFace datasets
             logger.warning("⚠️ Loading WikiText-2 (VERY SMALL dataset)")
@@ -3141,6 +3300,10 @@ class WikiTextDataset:
         Excellent for learning narrative structure and diverse vocabulary.
         Note: Using bookcorpusopen which works with modern datasets library.
         """
+        load_dataset = WikiTextDataset._get_hf_datasets()
+        if load_dataset is None:
+            raise ImportError("HuggingFace datasets not available for BookCorpus")
+            
         try:
             logger.info(f"Loading BookCorpus ({split} split)...")
             # Use alternative repository that works with modern datasets library
@@ -3163,6 +3326,11 @@ class WikiTextDataset:
         
         Contains news articles for factual content and current events vocabulary.
         """
+        load_dataset = WikiTextDataset._get_hf_datasets()
+        if load_dataset is None:
+            logger.warning("HuggingFace datasets not available for CC-News")
+            return []
+            
         try:
             logger.info(f"Loading CC-News ({split} split)...")
             dataset = load_dataset('cc_news', split=split, cache_dir=cache_dir)
@@ -3183,6 +3351,11 @@ class WikiTextDataset:
         High-quality web content covering diverse topics and writing styles.
         Note: Using Skylion007/openwebtext which has been converted to Parquet.
         """
+        load_dataset = WikiTextDataset._get_hf_datasets()
+        if load_dataset is None:
+            logger.warning("HuggingFace datasets not available for OpenWebText")
+            return []
+            
         try:
             logger.info(f"Loading OpenWebText ({split} split)...")
             # Use the Parquet-converted version that works with modern datasets library
