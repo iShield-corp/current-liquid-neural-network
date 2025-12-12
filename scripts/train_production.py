@@ -373,68 +373,39 @@ def load_dataset(args, tokenizer, split='train'):
     if args.dataset == 'custom':
         if not args.custom_dataset_path:
             raise ValueError("--custom-dataset-path required for custom dataset")
-        return TextDataset(
-            args.custom_dataset_path,
-            tokenizer,
-            max_length=args.seq_length
-        )
+        # Load custom text file
+        with open(args.custom_dataset_path, 'r') as f:
+            texts = [line.strip() for line in f if line.strip()]
+        return TextDataset(texts, tokenizer, args.seq_length)
+        
     elif args.dataset == 'combined':
-        # Combined datasets mode
-        if not args.combined_datasets:
-            raise ValueError("--combined-datasets required when using --dataset combined")
+        # Combined datasets mode - use WikiTextDataset.load_combined_dataset
+        dataset_names = [name.strip() for name in args.combined_datasets.split(',')] if args.combined_datasets else ['wikitext103']
         
-        logger.info(f"Loading combined datasets: {args.combined_datasets}")
-        datasets = []
-        dataset_names = [name.strip() for name in args.combined_datasets.split(',')]
+        logger.info(f"Loading combined datasets: {dataset_names}")
         
-        for name in dataset_names:
-            if name == 'wikitext2':
-                ds = WikiTextDataset.create_dataset(
-                    version='wikitext-2-v1',
-                    split=split,
-                    tokenizer=tokenizer,
-                    max_length=args.seq_length
-                )
-                datasets.append(ds)
-                logger.info(f"  ✅ Added wikitext2 ({len(ds)} samples)")
-            elif name == 'wikitext103':
-                ds = WikiTextDataset.create_dataset(
-                    version='wikitext-103-v1',
-                    split=split,
-                    tokenizer=tokenizer,
-                    max_length=args.seq_length
-                )
-                datasets.append(ds)
-                logger.info(f"  ✅ Added wikitext103 ({len(ds)} samples)")
-            elif name in ['programming', 'bookcorpus', 'openwebtext']:
-                # These would need specific loaders - for now, log warning
-                logger.warning(f"  ⚠️  Dataset '{name}' not yet implemented, skipping")
-            else:
-                logger.warning(f"  ⚠️  Unknown dataset '{name}', skipping")
+        # Use the WikiTextDataset loader
+        texts = WikiTextDataset.load_combined_dataset(
+            datasets=dataset_names,
+            split=split,
+            cache_dir='./data'
+        )
         
-        if not datasets:
-            raise ValueError("No valid datasets loaded from combined list")
-        
-        # Concatenate all datasets
-        from torch.utils.data import ConcatDataset
-        combined = ConcatDataset(datasets)
-        logger.info(f"Combined dataset total: {len(combined)} samples")
-        return combined
+        logger.info(f"✅ Combined dataset: {len(texts):,} texts loaded")
+        return TextDataset(texts, tokenizer, args.seq_length)
         
     elif args.dataset == 'wikitext2':
-        return WikiTextDataset.create_dataset(
-            version='wikitext-2-v1',
-            split=split,
-            tokenizer=tokenizer,
-            max_length=args.seq_length
-        )
+        # Load WikiText-2 texts
+        texts = WikiTextDataset.load_wikitext2(split=split, cache_dir='./data')
+        logger.info(f"✅ WikiText-2: {len(texts):,} texts loaded")
+        return TextDataset(texts, tokenizer, args.seq_length)
+        
     elif args.dataset == 'wikitext103':
-        return WikiTextDataset.create_dataset(
-            version='wikitext-103-v1',
-            split=split,
-            tokenizer=tokenizer,
-            max_length=args.seq_length
-        )
+        # Load WikiText-103 texts
+        texts = WikiTextDataset.load_wikitext103(split=split, cache_dir='./data')
+        logger.info(f"✅ WikiText-103: {len(texts):,} texts loaded")
+        return TextDataset(texts, tokenizer, args.seq_length)
+        
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
