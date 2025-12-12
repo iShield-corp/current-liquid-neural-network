@@ -273,6 +273,8 @@ class LiquidSpikingCLI:
         mamba_group.add_argument('--integration-mode', choices=['sequential', 'parallel', 'bidirectional'],
                                 help='Mamba integration mode')
         mamba_group.add_argument('--mamba-d-state', type=int, help='Mamba state dimension')
+        mamba_group.add_argument('--mamba-d-conv', type=int, help='Mamba convolution kernel size')
+        mamba_group.add_argument('--mamba-expand', type=int, help='Mamba expansion factor')
         mamba_group.add_argument('--use-cross-attention', action='store_true', help='Enable cross-attention (for bidirectional mode)')
         mamba_group.add_argument('--use-adaptive-gating', action='store_true', help='Enable adaptive gating')
         
@@ -432,45 +434,85 @@ class LiquidSpikingCLI:
             'train_production.py'
         )
         
+        # Start with required args
         cmd = [
             sys.executable,
             str(script_path),
             '--model-size', args.model_size,
-            '--num-layers', str(args.num_layers),
-            '--hidden-dim', str(args.hidden_dim),
-            '--liquid-units', str(args.liquid_units),           # NEW
-            '--spiking-units', str(args.spiking_units),         # NEW
-            '--num-attention-heads', str(args.num_attention_heads),  # NEW
             '--epochs', str(args.epochs),
             '--batch-size', str(args.batch_size),
-            '--learning-rate', str(args.learning_rate),
-            '--gradient-clip', str(args.gradient_clip),
             '--seq-length', str(args.sequence_length),
             '--dataset', args.dataset,
-            '--tokenizer', args.tokenizer,
+            '--tokenizer', getattr(args, 'tokenizer', 'gpt2'),
             '--checkpoint-dir', args.output_dir,
             '--checkpoint-freq', str(args.save_interval),
             '--accumulation-steps', str(getattr(args, 'accumulation_steps', 1)),
             '--patience', str(getattr(args, 'patience', 10)),
         ]
         
-        # Add boolean flags
-        if args.use_mamba:                                      # NEW
-            cmd.append('--use-mamba')
-        if args.integration_mode:                               # NEW
-            cmd.extend(['--integration-mode', args.integration_mode])
-        if args.mamba_d_state:                                  # NEW
-            cmd.extend(['--mamba-d-state', str(args.mamba_d_state)])
-        if args.use_cross_attention:                            # NEW
-            cmd.append('--use-cross-attention')
-        if args.use_adaptive_gating:                            # NEW
-            cmd.append('--use-adaptive-gating')
-        if args.use_stdp:                                       # NEW
-            cmd.append('--use-stdp')
-        if args.use_meta_plasticity:                            # NEW
-            cmd.append('--use-meta-plasticity')
+        # Add optional args only if they have values (not None)
+        if args.num_layers is not None:
+            cmd.extend(['--num-layers', str(args.num_layers)])
+        if args.hidden_dim is not None:
+            cmd.extend(['--hidden-dim', str(args.hidden_dim)])
+        if args.liquid_units is not None:
+            cmd.extend(['--liquid-units', str(args.liquid_units)])
+        if args.spiking_units is not None:
+            cmd.extend(['--spiking-units', str(args.spiking_units)])
+        if args.num_attention_heads is not None:
+            cmd.extend(['--num-attention-heads', str(args.num_attention_heads)])
+        if args.learning_rate is not None:
+            cmd.extend(['--learning-rate', str(args.learning_rate)])
+        if args.gradient_clip is not None:
+            cmd.extend(['--gradient-clip', str(args.gradient_clip)])
+        
+        # Combined datasets
+        if args.dataset == 'combined' and hasattr(args, 'combined_datasets'):
+            cmd.extend(['--combined-datasets', args.combined_datasets])
+        
+        # Boolean flags
         if args.mixed_precision:
             cmd.append('--mixed-precision')
+        
+        # Mamba integration
+        if getattr(args, 'use_mamba', False):
+            cmd.append('--use-mamba')
+            if hasattr(args, 'integration_mode') and args.integration_mode:
+                cmd.extend(['--integration-mode', args.integration_mode])
+            if hasattr(args, 'mamba_d_state') and args.mamba_d_state:
+                cmd.extend(['--mamba-d-state', str(args.mamba_d_state)])
+            if hasattr(args, 'mamba_d_conv') and args.mamba_d_conv:
+                cmd.extend(['--mamba-d-conv', str(args.mamba_d_conv)])
+            if hasattr(args, 'mamba_expand') and args.mamba_expand:
+                cmd.extend(['--mamba-expand', str(args.mamba_expand)])
+            if hasattr(args, 'use_cross_attention') and args.use_cross_attention:
+                cmd.append('--use-cross-attention')
+            if hasattr(args, 'use_adaptive_gating') and args.use_adaptive_gating:
+                cmd.append('--use-adaptive-gating')
+        
+        # STDP and meta-plasticity
+        if getattr(args, 'use_stdp', False):
+            cmd.append('--use-stdp')
+        if getattr(args, 'use_meta_plasticity', False):
+            cmd.append('--use-meta-plasticity')
+        
+        # Continual learning
+        if getattr(args, 'use_continual_learning', False):
+            cmd.append('--use-continual-learning')
+            if hasattr(args, 'episodic_memory_size'):
+                cmd.extend(['--episodic-memory-size', str(args.episodic_memory_size)])
+            if hasattr(args, 'replay_buffer_size'):
+                cmd.extend(['--replay-buffer-size', str(args.replay_buffer_size)])
+            if hasattr(args, 'ewc_lambda'):
+                cmd.extend(['--ewc-lambda', str(args.ewc_lambda)])
+            if hasattr(args, 'si_c'):
+                cmd.extend(['--si-c', str(args.si_c)])
+            if hasattr(args, 'consolidation_frequency'):
+                cmd.extend(['--consolidation-frequency', str(args.consolidation_frequency)])
+            if hasattr(args, 'replay_frequency'):
+                cmd.extend(['--replay-frequency', str(args.replay_frequency)])
+            if getattr(args, 'enable_progressive_networks', False):
+                cmd.append('--enable-progressive-networks')
         
         # Device
         if args.device != 'auto':
@@ -555,6 +597,32 @@ class LiquidSpikingCLI:
             
             if args.enable_progressive_networks:
                 cmd.append("--enable-progressive-networks")
+        
+        # Add Mamba args if enabled
+        if getattr(args, 'use_mamba', False):
+            cmd.append("--use-mamba")
+            if hasattr(args, 'integration_mode') and args.integration_mode:
+                cmd.extend(["--integration-mode", args.integration_mode])
+            if hasattr(args, 'mamba_d_state') and args.mamba_d_state:
+                cmd.extend(["--mamba-d-state", str(args.mamba_d_state)])
+            if hasattr(args, 'mamba_d_conv') and args.mamba_d_conv:
+                cmd.extend(["--mamba-d-conv", str(args.mamba_d_conv)])
+            if hasattr(args, 'mamba_expand') and args.mamba_expand:
+                cmd.extend(["--mamba-expand", str(args.mamba_expand)])
+            if hasattr(args, 'use_cross_attention') and args.use_cross_attention:
+                cmd.append("--use-cross-attention")
+            if hasattr(args, 'use_adaptive_gating') and args.use_adaptive_gating:
+                cmd.append("--use-adaptive-gating")
+        
+        # Add STDP and meta-plasticity args if enabled
+        if getattr(args, 'use_stdp', False):
+            cmd.append("--use-stdp")
+        if getattr(args, 'use_meta_plasticity', False):
+            cmd.append("--use-meta-plasticity")
+        
+        # Add combined datasets if specified
+        if args.dataset == 'combined' and hasattr(args, 'combined_datasets') and args.combined_datasets:
+            cmd.extend(["--combined-datasets", args.combined_datasets])
         
         # Print command for debugging
         self.console.print(f"Executing: {' '.join(cmd)}", style="info")

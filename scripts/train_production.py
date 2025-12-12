@@ -78,8 +78,10 @@ def parse_args():
     
     # Dataset parameters
     parser.add_argument('--dataset', type=str, default='wikitext2',
-                        choices=['wikitext2', 'wikitext103', 'custom'],
+                        choices=['wikitext2', 'wikitext103', 'custom', 'combined'],
                         help='Dataset to use')
+    parser.add_argument('--combined-datasets', type=str, default=None,
+                        help='Comma-separated list of datasets for combined mode (e.g., programming,wikitext103,bookcorpus,openwebtext)')
     parser.add_argument('--custom-dataset-path', type=str, default=None,
                         help='Path to custom dataset (if dataset=custom)')
     parser.add_argument('--tokenizer', type=str, default='gpt2',
@@ -193,6 +195,16 @@ def parse_args():
                             help='Enable cross-attention between Liquid and Mamba (bidirectional mode only)')
     mamba_group.add_argument('--use-adaptive-gating', action='store_true',
                             help='Enable adaptive gating for integration')
+    
+    # ============================================================
+    # STDP AND META-PLASTICITY PARAMETERS (NEW)
+    # ============================================================
+    plasticity_group = parser.add_argument_group('Plasticity Mechanisms',
+                                                  'STDP and meta-plasticity features')
+    plasticity_group.add_argument('--use-stdp', action='store_true',
+                                  help='Enable Spike-Timing-Dependent Plasticity')
+    plasticity_group.add_argument('--use-meta-plasticity', action='store_true',
+                                  help='Enable meta-plasticity mechanisms')
     
     return parser.parse_args()
 
@@ -339,6 +351,20 @@ def setup_model_config(args) -> ModelConfig:
         logger.info(f"  ✅ Cross-Attention: {'Enabled' if args.use_cross_attention else 'Disabled'}")
         logger.info(f"  ✅ Adaptive Gating: {'Enabled' if args.use_adaptive_gating else 'Disabled'}")
     
+    # ============================================================
+    # ADD STDP AND META-PLASTICITY PARAMETERS (NEW)
+    # ============================================================
+    if args.use_stdp or args.use_meta_plasticity:
+        logger.info("⚡ Enabling Plasticity Mechanisms...")
+        
+        if args.use_stdp:
+            config.use_stdp = True
+            logger.info(f"  ✅ STDP: Enabled")
+        
+        if args.use_meta_plasticity:
+            config.use_meta_plasticity = True
+            logger.info(f"  ✅ Meta-plasticity: Enabled")
+    
     return config
 
 
@@ -352,6 +378,49 @@ def load_dataset(args, tokenizer, split='train'):
             tokenizer,
             max_length=args.seq_length
         )
+    elif args.dataset == 'combined':
+        # Combined datasets mode
+        if not args.combined_datasets:
+            raise ValueError("--combined-datasets required when using --dataset combined")
+        
+        logger.info(f"Loading combined datasets: {args.combined_datasets}")
+        datasets = []
+        dataset_names = [name.strip() for name in args.combined_datasets.split(',')]
+        
+        for name in dataset_names:
+            if name == 'wikitext2':
+                ds = WikiTextDataset(
+                    version='wikitext-2-v1',
+                    split=split,
+                    tokenizer=tokenizer,
+                    max_length=args.seq_length
+                )
+                datasets.append(ds)
+                logger.info(f"  ✅ Added wikitext2 ({len(ds)} samples)")
+            elif name == 'wikitext103':
+                ds = WikiTextDataset(
+                    version='wikitext-103-v1',
+                    split=split,
+                    tokenizer=tokenizer,
+                    max_length=args.seq_length
+                )
+                datasets.append(ds)
+                logger.info(f"  ✅ Added wikitext103 ({len(ds)} samples)")
+            elif name in ['programming', 'bookcorpus', 'openwebtext']:
+                # These would need specific loaders - for now, log warning
+                logger.warning(f"  ⚠️  Dataset '{name}' not yet implemented, skipping")
+            else:
+                logger.warning(f"  ⚠️  Unknown dataset '{name}', skipping")
+        
+        if not datasets:
+            raise ValueError("No valid datasets loaded from combined list")
+        
+        # Concatenate all datasets
+        from torch.utils.data import ConcatDataset
+        combined = ConcatDataset(datasets)
+        logger.info(f"Combined dataset total: {len(combined)} samples")
+        return combined
+        
     elif args.dataset == 'wikitext2':
         return WikiTextDataset(
             version='wikitext-2-v1',
