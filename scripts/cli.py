@@ -490,156 +490,84 @@ class LiquidSpikingCLI:
             self.logger.warning("⚠️  Training interrupted by user")
             return 1
         
-    def _continue_legacy_training(self, args, config, model):
-        """Continue with legacy training after model creation."""
+    def _continue_legacy_training(self, args):
+        """Continue using legacy training with production script."""
+        self.console.print(Panel.fit(
+            "Production Training Mode",
+            style="bold cyan"
+        ))
         
-        device = torch.device("cuda" if torch.cuda.is_available() and args.device != 'cpu' else "cpu")
-        model = model.to(device)
-        self.logger.info(f"🖥️  Using device: [bold yellow]{device}[/bold yellow]")
+        self.console.print("🚀 Using optimized production training script", style="info")
+        self.console.print("   ✅ Fixed Trainer class with all gradient flow fixes", style="info")
+        self.console.print("   ✅ Proper LR scheduling from epoch 0", style="info")
+        self.console.print("   ✅ Checkpointing and early stopping", style="info")
+        self.console.print("")
         
-        # Apply training fixes if requested
-        if getattr(args, 'use_fixes', False):
-            if not FIXES_AVAILABLE:
-                self.logger.warning("⚠️  Training fixes requested but module not available. Continuing without fixes.")
-            else:
-                self.logger.info("🔧 Applying training fixes for improved gradient flow...")
-                model = apply_training_fixes(model, config)
-                self.logger.success("✅ Training fixes applied!")
-                self.logger.info("   • Surrogate gradient slope: 5 → 25")
-                self.logger.info("   • Xavier weight initialization")
-                self.logger.info("   • Multi-path spike decoder")
-                self.logger.info("   • Optimized output head")
+        # Build command for production script
+        script_path = Path(__file__).parent / "train_production.py"
         
-        # Load Dataset
-        self.logger.header("Dataset Loading")
-        if args.task == 'llm':
-            dataset_type = getattr(args, 'dataset', 'wikitext103')
-            cache_dir = getattr(args, 'dataset_cache_dir', './data')
-            combined_datasets = [d.strip() for d in args.combined_datasets.split(',')]
+        # Build base command
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--model-size", args.model_size,
+            "--epochs", str(args.epochs),
+            "--batch-size", str(args.batch_size),
+            "--seq-length", str(args.sequence_length),
+            "--dataset", args.dataset,
+            "--tokenizer", args.tokenizer,
+            "--checkpoint-dir", args.output_dir,
+            "--checkpoint-freq", str(args.save_interval),
+            "--accumulation-steps", str(args.accumulation_steps),
+            "--patience", str(args.patience),
+        ]
+        
+        # Only add optional args if they have actual values (not None)
+        if args.num_layers is not None:
+            cmd.extend(["--num-layers", str(args.num_layers)])
+        if args.hidden_dim is not None:
+            cmd.extend(["--hidden-dim", str(args.hidden_dim)])
+        if args.liquid_units is not None:
+            cmd.extend(["--liquid-units", str(args.liquid_units)])
+        if args.spiking_units is not None:
+            cmd.extend(["--spiking-units", str(args.spiking_units)])
+        if args.num_attention_heads is not None:
+            cmd.extend(["--num-attention-heads", str(args.num_attention_heads)])
+        if args.learning_rate is not None:
+            cmd.extend(["--learning-rate", str(args.learning_rate)])
+        if args.gradient_clip is not None:
+            cmd.extend(["--gradient-clip", str(args.gradient_clip)])
+        
+        if args.mixed_precision:
+            cmd.append("--mixed-precision")
+        
+        # Add continual learning args if enabled
+        if args.use_continual_learning:
+            cmd.append("--use-continual-learning")
+            cmd.extend([
+                "--episodic-memory-size", str(args.episodic_memory_size),
+                "--replay-buffer-size", str(args.replay_buffer_size),
+                "--ewc-lambda", str(args.ewc_lambda),
+                "--si-c", str(args.si_c),
+                "--consolidation-frequency", str(args.consolidation_frequency),
+                "--replay-frequency", str(args.replay_frequency)
+            ])
             
-            self.logger.info(f"📚 Loading dataset: [bold cyan]{dataset_type}[/bold cyan]")
-            
-            dataset, tokenizer = DatasetFactory.create_llm_dataset(
-                vocab_size=config.vocab_size,
-                seq_length=config.sequence_length,
-                tokenizer_type=getattr(args, 'tokenizer', 'gpt2'),
-                dataset_type=dataset_type,
-                combined_datasets=combined_datasets,
-                cache_dir=cache_dir
-            )
-        elif args.task == 'vision':
-            dataset = DatasetFactory.create_vision_dataset()
-        else:
-            dataset = DatasetFactory.create_robotics_dataset()
-            
-        # Split dataset
-        train_size = int(0.9 * len(dataset))
-        val_size = len(dataset) - train_size
-        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+            if args.enable_progressive_networks:
+                cmd.append("--enable-progressive-networks")
         
-        train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+        # Print command for debugging
+        self.console.print(f"Executing: {' '.join(cmd)}", style="info")
+        self.console.print("")
         
-        self.logger.info(f"📊 Training samples: {train_size:,}")
-        self.logger.info(f"📊 Validation samples: {val_size:,}")
-        
-        # Run diagnostics if requested
-        if getattr(args, 'diagnose', False) and FIXES_AVAILABLE:
-            self.logger.header("Pre-Training Diagnostics")
-            diagnostics = diagnose_training_stuck(model, train_loader, device)
-            if diagnostics:
-                self.logger.info("📊 Diagnostic results available in logs")
-        
-        # Initialize Trainer
-        trainer = LiquidSpikingTrainer(model, config)
-        
-        # Add warmup scheduler if using fixes
-        if getattr(args, 'use_fixes', False) and FIXES_AVAILABLE:
-            num_training_steps = len(train_loader) * args.epochs
-            num_warmup_steps = len(train_loader) * 2  # 2 epochs warmup
-            trainer.scheduler = add_warmup_scheduler(
-                trainer.optimizer,
-                num_warmup_steps,
-                num_training_steps
-            )
-            self.logger.info(f"📈 Added warmup scheduler ({num_warmup_steps} steps)")
-        
-        # Training Loop
-        os.makedirs(args.output_dir, exist_ok=True)
-        self.logger.header("Training Progress")
-        
-        # Track all epoch metrics
-        epoch_history = []
-        
-        # Add gradient monitor if using fixes
-        grad_monitor = None
-        if getattr(args, 'use_fixes', False) and FIXES_AVAILABLE:
-            grad_monitor = GradientHealthMonitor(model)
-            self.logger.info("📊 Gradient health monitoring enabled")
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-            TimeElapsedColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task(f"[cyan]Training {args.epochs} epochs...", total=args.epochs)
-            
-            for epoch in range(args.epochs):
-                train_loss, grad_norm = trainer.train_epoch(train_loader)
-                val_loss, val_acc, is_best = trainer.validate(val_loader)
-                
-                # Store epoch metrics
-                epoch_metrics = {
-                    'epoch': epoch + 1,
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'val_acc': val_acc,
-                    'grad_norm': grad_norm,
-                    'is_best': is_best
-                }
-                epoch_history.append(epoch_metrics)
-                
-                # Check gradient health if using fixes
-                if grad_monitor:
-                    grad_stats = grad_monitor.check_gradients()
-                    grad_health = "✓" if grad_stats['mean_norm'] > 1e-6 else "⚠"
-                    grad_info = f" [{grad_health} Grad: {grad_stats['mean_norm']:.6f}]"
-                else:
-                    grad_info = ""
-                
-                best_marker = " ⭐" if is_best else ""
-                self.logger.info(
-                    f"Epoch {epoch+1}/{args.epochs}: "
-                    f"Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
-                    f"Val Acc={val_acc:.4f}{best_marker}{grad_info}"
-                )
-                
-                # Check if learning is stuck (when using fixes)
-                if grad_monitor and epoch > 2:
-                    prev_loss = epoch_history[-2]['train_loss']
-                    loss_change = abs(train_loss - prev_loss)
-                    if loss_change < 1e-6:
-                        self.logger.warning(f"⚠️  Loss not changing (Δ={loss_change:.8f})")
-                        diagnosis = grad_monitor.diagnose()
-                        self.logger.warning(diagnosis)
-                
-                progress.advance(task)
-                
-                if (epoch + 1) % args.save_interval == 0:
-                    path = os.path.join(args.output_dir, f"{args.task}_epoch_{epoch+1}.pt")
-                    trainer.save_checkpoint(path)
-                    self.logger.info(f"💾 Checkpoint saved: {path}")
-        
-        # Display training summary after all epochs complete
-        self._display_training_summary(epoch_history, args.epochs)
-                    
-        final_path = os.path.join(args.output_dir, f"{args.task}_final_model.pt")
-        trainer.save_checkpoint(final_path)
-        self.logger.success(f"Training complete! Model saved to {final_path}")
+        # Execute
+        import subprocess
+        try:
+            result = subprocess.run(cmd, check=True)
+            return result.returncode
+        except subprocess.CalledProcessError as e:
+            self.console.print(f"❌ Training failed with error code {e.returncode}", style="error")
+            return e.returncode
 
     def _handle_inference(self, args):
         self.logger.header("Inference")

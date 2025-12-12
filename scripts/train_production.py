@@ -172,6 +172,28 @@ def parse_args():
     parser.add_argument('--wandb-project', type=str, default='liquid-spiking-llm',
                         help='W&B project name')
     
+    # ============================================================
+    # MAMBA INTEGRATION PARAMETERS (NEW)
+    # ============================================================
+    mamba_group = parser.add_argument_group('Mamba SSM Integration', 
+                                            'Long-range sequence modeling with Mamba')
+    mamba_group.add_argument('--use-mamba', action='store_true',
+                            help='Enable Mamba SSM integration')
+    mamba_group.add_argument('--integration-mode', 
+                            choices=['sequential', 'parallel', 'bidirectional'],
+                            default='bidirectional',
+                            help='Mamba-Liquid-Spiking integration mode (default: bidirectional)')
+    mamba_group.add_argument('--mamba-d-state', type=int, default=16,
+                            help='Mamba state space dimension (default: 16)')
+    mamba_group.add_argument('--mamba-d-conv', type=int, default=4,
+                            help='Mamba convolution kernel size (default: 4)')
+    mamba_group.add_argument('--mamba-expand', type=int, default=2,
+                            help='Mamba expansion factor (default: 2)')
+    mamba_group.add_argument('--use-cross-attention', action='store_true',
+                            help='Enable cross-attention between Liquid and Mamba (bidirectional mode only)')
+    mamba_group.add_argument('--use-adaptive-gating', action='store_true',
+                            help='Enable adaptive gating for integration')
+    
     return parser.parse_args()
 
 
@@ -296,6 +318,27 @@ def setup_model_config(args) -> ModelConfig:
         logger.info(f"  ✅ Consolidation: Every {args.consolidation_frequency} steps")
         logger.info(f"  ✅ Progressive Networks: {'Enabled' if args.enable_progressive_networks else 'Disabled'}")
     
+    # ============================================================
+    # ADD MAMBA INTEGRATION PARAMETERS (NEW)
+    # ============================================================
+    if args.use_mamba:
+        logger.info("🔗 Enabling Mamba SSM Integration...")
+        
+        config.use_mamba = True
+        config.integration_mode = args.integration_mode
+        config.mamba_d_state = args.mamba_d_state
+        config.mamba_d_conv = args.mamba_d_conv
+        config.mamba_expand = args.mamba_expand
+        config.use_cross_attention = args.use_cross_attention
+        config.use_adaptive_gating = args.use_adaptive_gating
+        
+        logger.info(f"  ✅ Integration Mode: {args.integration_mode}")
+        logger.info(f"  ✅ Mamba State Dim: {args.mamba_d_state}")
+        logger.info(f"  ✅ Mamba Conv Kernel: {args.mamba_d_conv}")
+        logger.info(f"  ✅ Mamba Expansion Factor: {args.mamba_expand}")
+        logger.info(f"  ✅ Cross-Attention: {'Enabled' if args.use_cross_attention else 'Disabled'}")
+        logger.info(f"  ✅ Adaptive Gating: {'Enabled' if args.use_adaptive_gating else 'Disabled'}")
+    
     return config
 
 
@@ -386,6 +429,17 @@ def save_training_config(args, config, checkpoint_dir):
             'si_c': getattr(config, 'si_c', 0),
             'consolidation_frequency': getattr(config, 'consolidation_frequency', 0),
             'enable_progressive_networks': getattr(config, 'enable_progressive_networks', False)
+        }
+    
+    # Add mamba config if enabled
+    if getattr(config, 'use_mamba', False):
+        config_dict['mamba_integration'] = {
+            'integration_mode': getattr(config, 'integration_mode', ''),
+            'mamba_d_state': getattr(config, 'mamba_d_state', 0),
+            'mamba_d_conv': getattr(config, 'mamba_d_conv', 0),
+            'mamba_expand': getattr(config, 'mamba_expand', 0),
+            'use_cross_attention': getattr(config, 'use_cross_attention', False),
+            'use_adaptive_gating': getattr(config, 'use_adaptive_gating', False)
         }
     
     config_path = Path(checkpoint_dir) / 'training_config.json'
