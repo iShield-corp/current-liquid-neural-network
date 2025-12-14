@@ -40,6 +40,63 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def store_episodic_memories_from_loader(trainer, dataloader, max_samples=100):
+    """Store representative examples in episodic memory during training.
+    
+    Args:
+        trainer: LiquidSpikingTrainer instance
+        dataloader: Training data loader
+        max_samples: Maximum number of samples to store
+    
+    Returns:
+        Number of samples actually stored
+    """
+    if not hasattr(trainer, 'continual_memory_system'):
+        return 0
+    
+    episodic_mem = trainer.continual_memory_system.episodic_memory
+    model = trainer.model
+    device = trainer.config.device
+    
+    model.eval()
+    samples_stored = 0
+    
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            if samples_stored >= max_samples:
+                break
+            
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            batch_size = inputs.size(0)
+            
+            # Get model outputs to extract hidden representations
+            try:
+                outputs = model(inputs)
+                # Use mean pooling over sequence dimension for key
+                if len(outputs.shape) == 3:  # [batch, seq, hidden]
+                    hidden = outputs.mean(dim=1)  # [batch, hidden]
+                else:
+                    hidden = outputs
+                
+                # Store each example in episodic memory
+                for i in range(min(batch_size, max_samples - samples_stored)):
+                    episodic_mem.store(
+                        key=hidden[i].unsqueeze(0),
+                        value=targets[i].unsqueeze(0),
+                        metadata={'sample_idx': samples_stored + i}
+                    )
+                
+                samples_stored += min(batch_size, max_samples - samples_stored)
+                
+            except Exception as e:
+                logger.warning(f"Failed to store episodic memory: {e}")
+                break
+    
+    model.train()
+    return samples_stored
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -556,41 +613,31 @@ def main():
     logger.info(f"Starting training for {args.epochs} epochs...")
     logger.info(f"Continual Learning: {'✅ ENABLED' if args.use_continual_learning else '❌ DISABLED'}")
     
+    # Initialize continual learning for single task (all epochs = one task)
+    task_id = 0
+    if args.use_continual_learning and hasattr(trainer, 'continual_memory_system'):
+        logger.info("🧠 Initializing continual learning for Task 0 (all epochs)")
+    
     for epoch in range(start_epoch, args.epochs):
         epoch_start_time = datetime.now()
         
-        # Train epoch - use train_on_task for continual learning support
-        if args.use_continual_learning:
-            train_acc = trainer.train_on_task(
-                task_id=epoch,  # Treat each epoch as a "task" for continual learning
-                train_loader=train_loader,
-                val_loader=val_loader,
-                num_epochs=1
+        # Use regular training loop (not train_on_task which treats each call as separate task)
+        train_loss = 0
+        model.train()
+        
+        # Training loop
+        train_loss = trainer.train_epoch(train_loader)
+        
+        # Validation
+        val_loss, train_acc = trainer.validate(val_loader)
+        
+        # Store episodic memories during training (spread across epochs)
+        if args.use_continual_learning and hasattr(trainer, 'continual_memory_system'):
+            samples_per_epoch = 50  # Store 50 representative samples per epoch
+            stored = store_episodic_memories_from_loader(
+                trainer, train_loader, max_samples=samples_per_epoch
             )
-            train_loss = trainer.train_losses[-1] if trainer.train_losses else 0
-            val_loss = trainer.val_losses[-1] if trainer.val_losses else 0
-        else:
-            # Standard training loop
-            train_loss = 0
-            model.train()
-            for batch_idx, (inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(config.device)
-                targets = targets.to(config.device)
-                
-                loss = trainer.training_step(inputs, targets)
-                train_loss += loss
-                
-                if batch_idx % args.log_interval == 0:
-                    logger.info(
-                        f"Epoch {epoch+1}/{args.epochs} "
-                        f"[{batch_idx}/{len(train_loader)}] "
-                        f"Loss: {loss:.4f}"
-                    )
-            
-            train_loss /= len(train_loader)
-            
-            # Validation
-            val_loss, train_acc = trainer.evaluate(val_loader)
+            logger.info(f"📝 Stored {stored} examples in episodic memory this epoch")
         
         epoch_time = (datetime.now() - epoch_start_time).total_seconds()
         
@@ -656,6 +703,26 @@ def main():
                 'config': config
             }, checkpoint_path)
             logger.info(f"📁 Saved checkpoint to {checkpoint_path}")
+    
+    # Finalize continual learning task after all epochs
+    if args.use_continual_learning and hasattr(trainer, 'continual_memory_system'):
+        logger.info("🧠 Finalizing continual learning for Task 0...")
+        logger.info("   Computing Fisher Information Matrix...")
+        logger.info("   Consolidating Synaptic Intelligence...")
+        
+        # This triggers EWC Fisher computation and SI consolidation
+        trainer.continual_memory_system.finalize_task(
+            task_id=task_id,
+            model=model,
+            dataloader=train_loader,
+            num_samples=200
+        )
+        
+        stats = trainer.continual_memory_system.get_memory_stats()
+        logger.info(f"✅ Task {task_id} finalized:")
+        logger.info(f"   Episodic memories: {stats['episodic_memory_usage']}/{stats['episodic_memory_capacity']}")
+        logger.info(f"   Replay buffer: {stats['replay_buffer_size']}/{stats['replay_buffer_capacity']}")
+        logger.info(f"   EWC tasks tracked: {stats['ewc_tasks']}")
     
     # Final save
     final_path = checkpoint_dir / 'final_model.pt'
